@@ -398,7 +398,7 @@ class Attention(MegatronModule, ABC):
             attention_mask = inputs[3]
             attn_mask_type = inputs[5]
             attn_mask_type = AttnMaskType(attn_mask_type.item())
-            output_ = self._run_core_attention(
+            output_ = apply_module(self.core_attention)(
                 query,
                 key,
                 value,
@@ -417,29 +417,6 @@ class Attention(MegatronModule, ABC):
         )
 
         return hidden_states
-
-    def _run_core_attention(
-        self,
-        query,
-        key,
-        value,
-        attention_mask,
-        attn_mask_type=None,
-        attention_bias=None,
-        packed_seq_params=None,
-        **extra_kwargs,
-    ):
-        """Run the configured core attention module."""
-        return apply_module(self.core_attention)(
-            query,
-            key,
-            value,
-            attention_mask,
-            attn_mask_type=attn_mask_type,
-            attention_bias=attention_bias,
-            packed_seq_params=packed_seq_params,
-            **extra_kwargs,
-        )
 
     def _allocate_memory(self, inference_max_sequence_length, batch_size, dim, dtype):
         """Allocate memory to store kv cache during inference."""
@@ -1524,10 +1501,14 @@ class SelfAttention(Attention):
             query = query[:, :, idx * size : (idx + 1) * size, :]
 
         if self.q_layernorm is not None:
+            nvtx_range_push(suffix="q_layernorm")
             query = apply_module(self.q_layernorm)(query)
+            nvtx_range_pop(suffix="q_layernorm")
 
         if self.k_layernorm is not None:
+            nvtx_range_push(suffix="k_layernorm")
             key = apply_module(self.k_layernorm)(key)
+            nvtx_range_pop(suffix="k_layernorm")
 
         if self.config.test_mode:
             self.run_realtime_tests()

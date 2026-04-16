@@ -36,6 +36,9 @@ class _TENormWithResidual:
 class TESpecProvider(BackendSpecProvider):
     """A protocol for providing the submodules used in Spec building."""
 
+    def __init__(self, fuse_layernorm_linear: bool = True):
+        self._fuse_layernorm_linear = fuse_layernorm_linear
+
     def linear(self) -> type:
         """Which linear module TE backend uses"""
         return TELinear
@@ -50,7 +53,7 @@ class TESpecProvider(BackendSpecProvider):
 
     def fuse_layernorm_and_linear(self) -> bool:
         """TE backend chooses a single module for layernorm and linear"""
-        return True
+        return self._fuse_layernorm_linear
 
     def column_parallel_layer_norm_linear(self) -> Optional[type]:
         """Which module for sequential layernorm and linear"""

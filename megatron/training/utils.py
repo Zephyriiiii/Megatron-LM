@@ -5,7 +5,7 @@ import json
 import os
 import sys
 import warnings
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from collections import defaultdict
 
@@ -766,22 +766,55 @@ def get_nvtx_range():
         time: If True, also track with Megatron timers (default: False)
         log_level: Timer log level (0=always, 1=default, 2=verbose). Default: 1
     """
-    from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+    try:
+        from torch.cuda import nvtx
+
+        @contextmanager
+        def nvtx_range(msg, time=False, log_level=1):
+            if time:
+                timers = get_timers()
+                timers(msg, log_level=log_level).start()
+            try:
+                nvtx.range_push(msg)
+                yield
+            finally:
+                nvtx.range_pop()
+                if time:
+                    timers(msg, log_level=log_level).stop()
+
+        return nvtx_range
+    except:
+        @contextmanager
+        def dummy_range(msg, time=False, log_level=1):
+            yield
+        return dummy_range
+
+
+def get_profile_range():
+    """Create a context manager that can emit both record_function and NVTX ranges."""
+
+    nvtx_range = get_nvtx_range()
 
     @contextmanager
-    def nvtx_range(msg, time=False, log_level=1):
-        if time:
-            timers = get_timers()
-            timers(msg, log_level=log_level).start()
-        try:
-            nvtx_range_push(msg)
-            yield
-        finally:
-            nvtx_range_pop(msg)
-            if time:
-                timers(msg, log_level=log_level).stop()
+    def profile_range(
+        msg,
+        *,
+        with_record_function=False,
+        with_nvtx=False,
+        time=False,
+        log_level=1,
+    ):
+        record_ctx = (
+            torch.autograd.profiler.record_function(msg)
+            if with_record_function
+            else nullcontext()
+        )
+        nvtx_ctx = nvtx_range(msg, time=time, log_level=log_level) if with_nvtx else nullcontext()
+        with record_ctx:
+            with nvtx_ctx:
+                yield
 
-    return nvtx_range
+    return profile_range
 
 
 def has_nvrx_installed():

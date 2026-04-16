@@ -2242,14 +2242,67 @@ def nvtx_decorator(
     """
 
     def decorator(func: _Wrapped) -> _Wrapped:
-        if _nvtx_enabled and HAVE_NVTX:
-            return nvtx.annotate(
-                message=message or _nvtx_decorator_get_func_path(func), color=color
-            )(func)
-        return func
+        @wraps(func)
+        def wrapped(*args, **kwargs):
+            if _nvtx_enabled and HAVE_NVTX:
+                with nvtx.annotate(
+                    message=message or _nvtx_decorator_get_func_path(func), color=color
+                ):
+                    return func(*args, **kwargs)
+            return func(*args, **kwargs)
+
+        return wrapped
 
     return decorator
 
+
+def get_profile_range():
+    """Create a context manager that can emit both record_function and NVTX ranges."""
+
+    @contextmanager
+    def profile_range(
+        msg: str,
+        *,
+        with_record_function: bool = False,
+        with_nvtx: bool = False,
+    ):
+        record_ctx = (
+            torch.autograd.profiler.record_function(msg)
+            if with_record_function
+            else nullcontext()
+        )
+        with record_ctx:
+            if with_nvtx:
+                nvtx_range_push(msg=msg)
+            try:
+                yield
+            finally:
+                if with_nvtx:
+                    nvtx_range_pop(msg=msg)
+
+    return profile_range
+
+
+def make_backward_profile_hooks(msg: str):
+    """Create backward pre/post hooks that span module backward with profiler and NVTX ranges."""
+
+    ctx_stack = []
+
+    def backward_pre_hook(module, grad_output):
+        ctx = torch.autograd.profiler.record_function(msg)
+        ctx.__enter__()
+        ctx_stack.append(ctx)
+        nvtx_range_push(msg=msg)
+        return None
+
+    def backward_post_hook(module, grad_input, grad_output):
+        nvtx_range_pop(msg=msg)
+        if ctx_stack:
+            ctx = ctx_stack.pop()
+            ctx.__exit__(None, None, None)
+        return None
+
+    return backward_pre_hook, backward_post_hook
 
 def unwrap_model(model, module_instances=None):
     """Unwrap_model to return the final model instance"""

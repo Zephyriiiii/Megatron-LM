@@ -6,46 +6,44 @@ import argparse
 import dataclasses
 import json
 import os
-from pathlib import Path
 import re
 import types
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from packaging.version import Version as PkgVersion
 
+from megatron.core.activations import squared_relu
 from megatron.core.dist_checkpointing.validation import StrictHandling
+from megatron.core.fusions.fused_bias_geglu import quick_gelu
+from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.core.quantization.utils import (
+    kitchen_quantization_recipe_config,
+    load_quantization_recipe,
+)
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
-from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     HeterogeneousTransformerConfig,
     MLPConfig,
 )
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.utils import (
     get_torch_version,
     is_flashinfer_min_version,
     is_te_min_version,
     is_torch_min_version,
 )
-from megatron.core.activations import squared_relu
-from megatron.core.fusions.fused_bias_geglu import quick_gelu
-from megatron.training.global_vars import set_global_variables
+from megatron.training.argument_utils import ArgumentGroupFactory
 from megatron.training.utils import (
     get_device_arch_version,
-    update_use_dist_ckpt,
     print_rank_0,
+    update_use_dist_ckpt,
     warn_rank_0,
 )
-from megatron.core.msc_utils import MultiStorageClientFeature
 
-from megatron.core.quantization.utils import (
-    kitchen_quantization_recipe_config,
-    load_quantization_recipe,
-)
-
-from megatron.training.argument_utils import ArgumentGroupFactory
 
 def add_megatron_arguments(parser: argparse.ArgumentParser):
     """"Add Megatron-LM arguments to the given parser."""
@@ -85,35 +83,6 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_sft_args(parser)
 
     return parser
-
-def parse_and_validate_args(extra_args_provider=None, ignore_unknown_args=False, args_defaults={}):
-    args = parse_args(extra_args_provider, ignore_unknown_args)
-
-    if args.use_checkpoint_args or args_defaults.get("use_checkpoint_args", False):
-        from megatron.training.checkpointing import load_args_from_checkpoint
-
-        assert args.load is not None or args.pretrained_checkpoint is not None, "--use-checkpoint-args requires --load or --pretrained-checkpoint argument"
-        assert args.non_persistent_ckpt_type != "local", (
-            "--use-checkpoint-args is not supported with --non_persistent_ckpt_type=local. "
-            "Two-stage checkpoint loading is not implemented, and all arguments must be defined "
-            "before initializing LocalCheckpointManager."
-        )
-        load_args_from_checkpoint(args, load_arg='pretrained_checkpoint')
-        load_args_from_checkpoint(args)
-
-    if args.yaml_cfg is not None:
-        from megatron.training.yaml_arguments import validate_yaml
-
-        args = validate_yaml(args, args_defaults)
-    else:
-        validate_args(args, args_defaults)
-
-    # set global args, build tokenizer, and set adlr-autoresume,
-    # tensorboard-writer, and timers.
-    set_global_variables(args)
-
-    return args
-
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     """Parse all arguments."""
@@ -323,19 +292,14 @@ def tuple_type(x):
 
 def validate_args(args, defaults={}):
 
-    # Prep for checkpoint conversion.
-    if args.ckpt_convert_format is not None:
-        assert args.ckpt_convert_save is not None
-        assert args.load is not None
-        args.exit_on_missing_checkpoint = True
-
     # Temporary
     assert args.non_persistent_ckpt_type in ['global', 'local', None], \
         'Currently only global and local checkpoints are supported'
     if args.non_persistent_ckpt_type == 'local':
         try:
-            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import \
-                LocalCheckpointManager
+            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
+                LocalCheckpointManager,
+            )
         except ModuleNotFoundError as e:
             raise RuntimeError('nvidia_resiliency_ext is required for local checkpointing') from e
 
@@ -603,15 +567,6 @@ def validate_args(args, defaults={}):
         print_rank_0('setting global batch size to {}'.format(args.global_batch_size))
     assert args.global_batch_size > 0
 
-    # Eval batch size defaults and validation.
-    if args.eval_global_batch_size is None:
-        args.eval_global_batch_size = args.global_batch_size
-    if args.eval_micro_batch_size is None:
-        args.eval_micro_batch_size = args.micro_batch_size
-    assert args.eval_global_batch_size % (args.eval_micro_batch_size * args.data_parallel_size) == 0, \
-        f"eval_global_batch_size ({args.eval_global_batch_size}) must be divisible by " \
-        f"eval_micro_batch_size ({args.eval_micro_batch_size}) * data_parallel_size ({args.data_parallel_size})"
-
     if args.perform_rl_step:
         num_generated_samples_per_inference_iteration = (
             args.grpo_samples_per_iteration * args.grpo_iterations)
@@ -658,8 +613,10 @@ def validate_args(args, defaults={}):
         )
 
     from megatron.core.ssm.mamba_hybrid_layer_allocation import (
-        Symbols, parse_hybrid_pattern, get_hybrid_total_layer_count,
+        Symbols,
+        get_hybrid_total_layer_count,
         get_hybrid_total_pipeline_segment_count,
+        parse_hybrid_pattern,
     )
     sep = Symbols.MTP_SEPARATOR
 
@@ -934,13 +891,8 @@ def validate_args(args, defaults={}):
                 'all_gather instead, turning off fp8_param_gather',
                 args.rank,
             )
-        if args.fp4_param_gather and not is_te_min_version("2.7.0.dev0"):
-            args.fp4_param_gather = False
-            warn_rank_0(
-                'FSDP2 FP4 param gather is not supported yet in TE 2.0, will fallback to bf16'
-                'all_gather instead, turning off fp4_param_gather',
-                args.rank,
-            )
+        if args.fp4_param and not is_te_min_version("2.7.0.dev0"):
+            raise ValueError("--fp4-param requires Transformer Engine >= 2.7.0.dev0.")
 
     if args.overlap_param_gather_with_optimizer_step:
         assert args.use_distributed_optimizer, \
@@ -980,7 +932,7 @@ def validate_args(args, defaults={}):
         raise ValueError("--fp4-format and --fp8-format cannot be used simultaneously. Please choose one.")
 
     # FP4 param requires FP4 mode
-    if args.fp4_param_gather and not args.fp4:
+    if args.fp4_param and not args.fp4:
         raise ValueError("--fp4-param-gather must be used together with --fp4-format.")
 
     # FP4 requires TE >= 2.7.0.dev0
@@ -1721,6 +1673,7 @@ def core_transformer_config_from_args(args, config_class=None):
         if hasattr(args, f.name):
             kw_args[f.name] = getattr(args, f.name)
     kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
+    kw_args['te_fuse_layernorm_linear'] = not args.disable_te_layernorm_linear_fusion
     kw_args['deallocate_pipeline_outputs'] = True
     kw_args['pipeline_dtype'] = args.params_dtype
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
@@ -1729,7 +1682,6 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
     kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
     kw_args['fp8_param'] = args.fp8_param_gather
-    kw_args['fp4_param'] = args.fp4_param_gather
     if args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
@@ -1795,18 +1747,21 @@ def core_transformer_config_from_args(args, config_class=None):
 def _add_transformer_engine_args(parser):
     group = parser.add_argument_group(title='Transformer-Engine')
 
-    # FP4 related arguments
-    group.add_argument('--fp4-param-gather', action='store_true',
-                       help='Keep the compute param in fp4 (do not use any other intermediate '
-                            'dtype) and perform the param all-gather in fp4.')
-    # FP8 related arguments
+    # delayed scaling only configs
     group.add_argument('--fp8-param-gather', action='store_true',
                        help='Keep the compute param in fp8 (do not use any other intermediate '
                             'dtype) and perform the param all-gather in fp8.')
-    # TE precision config file
+
+    # FP4 related arguments
     group.add_argument('--te-precision-config-file', default=None,
                        help='Configuration file to select per-module precision overrides. '
                        'See TransformerEngineMixedPrecision.md')
+    group.add_argument(
+        '--disable-te-layernorm-linear-fusion',
+        action='store_true',
+        help='Disable Transformer-Engine LayerNorm/RMSNorm + Linear fused modules such as '
+             'TELayerNormColumnParallelLinear for easier profiling/decomposition.',
+    )
     return parser
 
 def _add_inference_args(parser):
@@ -2066,7 +2021,6 @@ def _add_network_size_args(parser):
         # args uses same var with a different name
         "num_moe_experts",
         "fp8_param",
-        "fp4_param",
         # incompatible defaults in dataclass
         "gradient_accumulation_fusion",
         "overlap_p2p_comm",
@@ -2489,10 +2443,9 @@ def _add_rl_args(parser):
     return parser
 
 def _add_training_args(parser):
-    from megatron.training.config import TrainingConfig
-    from megatron.training.config import ProfilingConfig
+    from megatron.training.config import ProfilingConfig, TrainingConfig
 
-    prof_factory = ArgumentGroupFactory(ProfilingConfig)
+    prof_factory = ArgumentGroupFactory(ProfilingConfig, exclude=["record_shapes"])
     prof_group = prof_factory.build_group(parser, "profiling")
 
     train_factory = ArgumentGroupFactory(TrainingConfig)
@@ -3347,7 +3300,7 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
     If kitchen isn't available, nothing to do here, return unchanged parser
     """
     try:
-        from megatron.core.extensions.kitchen import KitchenSpecProvider, HAVE_KITCHEN
+        from megatron.core.extensions.kitchen import HAVE_KITCHEN, KitchenSpecProvider
 
     except (ImportError, ModuleNotFoundError):
         HAVE_KITCHEN = False

@@ -29,8 +29,10 @@ from megatron.core.typed_torch import apply_module, copy_signature
 from megatron.core.utils import (
     deprecate_inference_params,
     get_pg_rank,
+    get_profile_range,
     is_te_min_version,
     log_single_rank,
+    make_backward_profile_hooks,
     make_viewless_tensor,
     nvtx_range_pop,
     nvtx_range_push,
@@ -40,6 +42,7 @@ if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
 
 logger = logging.getLogger(__name__)
+profile_range = get_profile_range()
 
 
 def get_transformer_layer_offset(
@@ -489,6 +492,30 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # use_nvfuser = TORCH_MAJOR > 1 or (TORCH_MAJOR == 1 and TORCH_MINOR >= 10)
         # self.bias_dropout_add_exec_handler = nullcontext if use_nvfuser else torch.enable_grad
         self.bias_dropout_add_exec_handler = torch.enable_grad
+        self._register_backward_profile_hooks()
+
+    def _register_backward_profile_hooks(self):
+        """Register high-level backward profiling hooks on the layer and its major submodules."""
+
+        hook_specs = (
+            (self.self_attention, "layer/self_attention/backward"),
+            (self.input_layernorm, "layer/input_layernorm/backward"),
+            (self.self_attn_bda, "layer/self_attn_bda/backward"),
+            (self.pre_mlp_layernorm, "layer/pre_mlp_layernorm/backward"),
+            (self.mlp, "layer/mlp/backward"),
+            (self.mlp_bda, "layer/mlp_bda/backward"),
+        )
+        self._profile_backward_hook_handles = []
+        for module, msg in hook_specs:
+            if not hasattr(module, "register_full_backward_pre_hook"):
+                continue
+            backward_pre_hook, backward_post_hook = make_backward_profile_hooks(msg)
+            self._profile_backward_hook_handles.append(
+                module.register_full_backward_pre_hook(backward_pre_hook)
+            )
+            self._profile_backward_hook_handles.append(
+                module.register_full_backward_hook(backward_post_hook)
+            )
 
     def create_mcore_cudagraph_manager(self, config):
         """Register the transformer layer for cudagraphs."""
@@ -577,15 +604,30 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         # Optional Input Layer norm
-        if self.recompute_input_layernorm:
-            self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
-                input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
-                    apply_module(self.input_layernorm), hidden_states
-                )
-        else:
-            with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
-                input_layernorm_output = apply_module(self.input_layernorm)(hidden_states)
+        with profile_range(
+            "layer/input_layernorm",
+            with_record_function=True,
+            with_nvtx=False,
+        ):
+            # Emit the NVTX range directly around the norm invocation so nsys can correlate
+            # the actual launch site instead of the surrounding offload/checkpoint control flow.
+            if self.recompute_input_layernorm:
+                self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+                with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
+                    nvtx_range_push(msg="layer/input_layernorm")
+                    try:
+                        input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
+                            apply_module(self.input_layernorm), hidden_states
+                        )
+                    finally:
+                        nvtx_range_pop(msg="layer/input_layernorm")
+            else:
+                with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
+                    nvtx_range_push(msg="layer/input_layernorm")
+                    try:
+                        input_layernorm_output = apply_module(self.input_layernorm)(hidden_states)
+                    finally:
+                        nvtx_range_pop(msg="layer/input_layernorm")
 
         if isinstance(input_layernorm_output, tuple):
             if len(input_layernorm_output) != 2:
@@ -612,18 +654,23 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Self attention.
         nvtx_range_push(suffix="self_attention")
-        attention_output_with_bias = self.self_attention(
-            input_layernorm_output,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            rotary_pos_cos_sin=rotary_pos_cos_sin,
-            attention_bias=attention_bias,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
-        )
+        with profile_range(
+            "layer/self_attention_core",
+            with_record_function=True,
+            with_nvtx=True,
+        ):
+            attention_output_with_bias = self.self_attention(
+                input_layernorm_output,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                rotary_pos_cos_sin=rotary_pos_cos_sin,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+            )
         nvtx_range_pop(suffix="self_attention")
 
         if self.recompute_input_layernorm:
@@ -636,16 +683,21 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="self_attn_bda")
-        if using_fused_tp_inference_kernel:
-            # In inference optimized transformer layer, there is no bias and dropout
-            # The remaining residual add is already handled inside the
-            # self attention module.
-            hidden_states = attention_output_with_bias[0]
-        else:
-            with self.bias_dropout_add_exec_handler():
-                hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                    attention_output_with_bias, residual, self.hidden_dropout
-                )
+        with profile_range(
+            "layer/self_attn_bda",
+            with_record_function=True,
+            with_nvtx=True,
+        ):
+            if using_fused_tp_inference_kernel:
+                # In inference optimized transformer layer, there is no bias and dropout
+                # The remaining residual add is already handled inside the
+                # self attention module.
+                hidden_states = attention_output_with_bias[0]
+            else:
+                with self.bias_dropout_add_exec_handler():
+                    hidden_states = self.self_attn_bda(
+                        self.training, self.config.bias_dropout_fusion
+                    )(attention_output_with_bias, residual, self.hidden_dropout)
         nvtx_range_pop(suffix="self_attn_bda")
 
         # Delay the offload of the attention norm until after the self_attn_bda has been computed
@@ -700,12 +752,31 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
-        hidden_states, context = self._forward_attention(*args, **kwargs)
-        output = self._forward_mlp(
-            hidden_states,
-            kwargs.get("inference_context", None),
-            padding_mask=kwargs.get("padding_mask", None),
-        )
+        # Condition embeddings for diffusion models (e.g. timestep or text embeddings),
+        # shape [batch_size, embeddings_dim]. Consumed here so it is not forwarded to
+        # _forward_attention. Subclasses that override forward() can use this directly.
+        conditions_embeddings = kwargs.pop("conditions_embeddings", None)
+        with profile_range(
+            "layer/transformer_block",
+            with_record_function=True,
+            with_nvtx=True,
+        ):
+            with profile_range(
+                "layer/self_attention",
+                with_record_function=True,
+                with_nvtx=True,
+            ):
+                hidden_states, context = self._forward_attention(*args, **kwargs)
+            with profile_range(
+                "layer/mlp",
+                with_record_function=True,
+                with_nvtx=True,
+            ):
+                output = self._forward_mlp(
+                    hidden_states,
+                    kwargs.get("inference_context", None),
+                    padding_mask=kwargs.get("padding_mask", None),
+                )
         return output, context
 
     def _forward_pre_mlp_layernorm(self, hidden_states: Tensor):
@@ -716,12 +787,20 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if self.recompute_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
-                pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
-                    apply_module(self.pre_mlp_layernorm), hidden_states
-                )
+                nvtx_range_push(msg="layer/pre_mlp_layernorm")
+                try:
+                    pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
+                        apply_module(self.pre_mlp_layernorm), hidden_states
+                    )
+                finally:
+                    nvtx_range_pop(msg="layer/pre_mlp_layernorm")
         else:
             with off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
-                pre_mlp_layernorm_output = apply_module(self.pre_mlp_layernorm)(hidden_states)
+                nvtx_range_push(msg="layer/pre_mlp_layernorm")
+                try:
+                    pre_mlp_layernorm_output = apply_module(self.pre_mlp_layernorm)(hidden_states)
+                finally:
+                    nvtx_range_pop(msg="layer/pre_mlp_layernorm")
 
         return pre_mlp_layernorm_output
 
@@ -747,7 +826,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
 
         # Optional Layer norm post the cross-attention.
-        pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
+        with profile_range(
+            "layer/pre_mlp_layernorm",
+            with_record_function=True,
+            with_nvtx=False,
+        ):
+            pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
 
         if isinstance(pre_mlp_layernorm_output, tuple):
             if len(pre_mlp_layernorm_output) != 2:
@@ -783,27 +867,42 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # import here to avoid circular import
                 from megatron.core.extensions.transformer_engine import te_checkpoint
 
-                mlp_output_with_bias = te_checkpoint(
-                    self.mlp,
-                    False,
-                    tensor_parallel.random.get_cuda_rng_tracker,
-                    self.pg_collection.tp,
-                    pre_mlp_layernorm_output,
-                    padding_mask=padding_mask,
-                )
+                with profile_range(
+                    "layer/mlp_core",
+                    with_record_function=True,
+                    with_nvtx=True,
+                ):
+                    mlp_output_with_bias = te_checkpoint(
+                        self.mlp,
+                        False,
+                        tensor_parallel.random.get_cuda_rng_tracker,
+                        self.pg_collection.tp,
+                        pre_mlp_layernorm_output,
+                        padding_mask=padding_mask,
+                    )
             else:
-                mlp_output_with_bias = tensor_parallel.checkpoint(
-                    functools.partial(self.mlp, padding_mask=padding_mask),
-                    False,
-                    pre_mlp_layernorm_output,
-                )
+                with profile_range(
+                    "layer/mlp_core",
+                    with_record_function=True,
+                    with_nvtx=True,
+                ):
+                    mlp_output_with_bias = tensor_parallel.checkpoint(
+                        functools.partial(self.mlp, padding_mask=padding_mask),
+                        False,
+                        pre_mlp_layernorm_output,
+                    )
         elif should_chunk_mlp_for_prefill:
             # Chunk input along sequence dimension
             num_chunks = min(self.config.mlp_chunks_for_prefill, pre_mlp_layernorm_output.shape[0])
             chunks = pre_mlp_layernorm_output.chunk(num_chunks, dim=0)
 
             # Compute outputs for each chunk
-            outputs = [self.mlp(chunk) for chunk in chunks]
+            with profile_range(
+                "layer/mlp_core",
+                with_record_function=True,
+                with_nvtx=True,
+            ):
+                outputs = [self.mlp(chunk) for chunk in chunks]
 
             # Aggregate chunk outputs
             mlp_output = torch.cat([out for out, _ in outputs], dim=0)
@@ -815,7 +914,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
                 # operation in MLP's fc2.
                 self._set_fc2_residual(residual)
-            mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, padding_mask=padding_mask)
+            with profile_range(
+                "layer/mlp_core",
+                with_record_function=True,
+                with_nvtx=True,
+            ):
+                mlp_output_with_bias = self.mlp(
+                    pre_mlp_layernorm_output, padding_mask=padding_mask
+                )
 
         nvtx_range_pop(suffix="mlp")
 
@@ -868,16 +974,21 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="mlp_bda")
-        if using_fused_tp_inference_kernel:
-            # In inference optimized transformer layer, there is no bias and dropout
-            # The remaining residual add is already handled inside the
-            # MLP module.
-            hidden_states = mlp_output_with_bias[0]
-        else:
-            with self.bias_dropout_add_exec_handler():
-                hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
-                    mlp_output_with_bias, residual, self.hidden_dropout
-                )
+        with profile_range(
+            "layer/mlp_bda",
+            with_record_function=True,
+            with_nvtx=True,
+        ):
+            if using_fused_tp_inference_kernel:
+                # In inference optimized transformer layer, there is no bias and dropout
+                # The remaining residual add is already handled inside the
+                # MLP module.
+                hidden_states = mlp_output_with_bias[0]
+            else:
+                with self.bias_dropout_add_exec_handler():
+                    hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
+                        mlp_output_with_bias, residual, self.hidden_dropout
+                    )
         nvtx_range_pop(suffix="mlp_bda")
         # Delay the offload of the mlp norm until after the mlp_bda has been computed
         # because the residual is needed in the mlp_bda.

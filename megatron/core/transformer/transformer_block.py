@@ -34,6 +34,8 @@ from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
     get_pg_rank,
+    get_profile_range,
+    make_backward_profile_hooks,
     make_viewless_tensor,
 )
 
@@ -66,6 +68,7 @@ else:
 
 
 logger = logging.getLogger(__name__)
+profile_range = get_profile_range()
 
 
 def get_num_layers_to_build(
@@ -382,6 +385,19 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         if self.config.inference_fuse_tp_communication:
             self._setup_fused_tp_communication()
+        self._register_backward_profile_hooks()
+
+    def _register_backward_profile_hooks(self) -> None:
+        """Register backward hooks for block-level non-attention/MLP modules."""
+
+        if self.final_layernorm is None:
+            return
+
+        backward_pre_hook, backward_post_hook = make_backward_profile_hooks(
+            "gpt/final_norm/backward"
+        )
+        self.final_layernorm.register_full_backward_pre_hook(backward_pre_hook)
+        self.final_layernorm.register_full_backward_hook(backward_post_hook)
 
     def has_final_layernorm_in_this_stage(self):
         """
@@ -450,6 +466,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         packed_seq_params: PackedSeqParams,
         use_inner_quantization_context: bool,
         padding_mask: Optional[Tensor] = None,
+        conditions_embeddings: Optional[Tensor] = None,
         extract_layer_indices: Optional[Set[int]] = None,
         layer_offset: int = 0,
     ):
@@ -479,6 +496,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 context_mask,
                 rotary_pos_emb,
                 padding_mask=None,
+                conditions_embeddings=None,
             ):
                 for index in range(start, end):
                     layer = self._get_layer(index)
@@ -510,6 +528,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             inference_context=None,
                             packed_seq_params=packed_seq_params,
                             padding_mask=padding_mask,
+                            conditions_embeddings=conditions_embeddings,
                         )
                 return hidden_states, context
 
@@ -530,6 +549,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     context_mask,
                     rotary_pos_emb,
                     padding_mask,
+                    conditions_embeddings,
                 )
             else:
                 return tensor_parallel.checkpoint(
@@ -541,6 +561,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     context_mask,
                     rotary_pos_emb,
                     padding_mask,
+                    conditions_embeddings,
                 )
 
         if self.config.recompute_method == 'uniform':
@@ -657,6 +678,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
+        conditions_embeddings: Optional[Tensor] = None,
         extract_layer_indices: Optional[Set[int]] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
@@ -694,6 +716,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 which to extract intermediate hidden states. If
                 non-empty, the forward pass will collect hidden_states
                 after each specified layer.
+            conditions_embeddings (Tensor, optional): Condition embeddings for diffusion models
+                (e.g. timestep or text embeddings). Shape [batch_size, embeddings_dim].
+                Passed through to each transformer layer's forward().
             dynamic_inference_decode_only: Optional[bool]: If true, indicates that the current
                 inference context is for decode-only. This args is only used to uniquely
                 identify decode and non-decode cuda graph runners in the cuda graph manager.
@@ -791,6 +816,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     packed_seq_params=packed_seq_params,
                     use_inner_quantization_context=use_inner_quantization_context,
                     padding_mask=padding_mask,
+                    conditions_embeddings=conditions_embeddings,
                     extract_layer_indices=extract_layer_indices,
                     layer_offset=layer_offset,
                 )
@@ -833,6 +859,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                             padding_mask=padding_mask,
+                            conditions_embeddings=conditions_embeddings,
                         )
 
                     if (
@@ -848,7 +875,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         # Final layer norm.
         if self.final_layernorm is not None:
-            hidden_states = apply_module(self.final_layernorm)(cast(Tensor, hidden_states))
+            with profile_range(
+                "gpt/final_norm",
+                with_record_function=torch.is_grad_enabled(),
+                with_nvtx=True,
+            ):
+                hidden_states = apply_module(self.final_layernorm)(cast(Tensor, hidden_states))
             # TENorm produces a "viewed" tensor. This will result in schedule.py's
             # deallocate_output_tensor() throwing an error, so a viewless tensor is
             # created to prevent this.

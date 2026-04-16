@@ -1,803 +1,803 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import warnings
+from typing import Optional, Union
 
-from collections import OrderedDict
-from typing import Dict, Literal, Optional
-
-import torch
-from torch import Tensor
-
-from megatron.core import tensor_parallel
-from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
-from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.models.common.embeddings import YarnRotaryEmbedding
-from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
-from megatron.core.models.common.embeddings.rotary_pos_embedding import (
-    MultimodalRotaryEmbedding,
-    RotaryEmbedding,
+from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.models.backends import (
+    BackendSpecProvider,
+    InferenceSpecProvider,
+    LocalSpecProvider,
 )
-from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    FineGrainedActivationOffloadingInterface as off_interface,
+from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
+from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
+from megatron.core.transformer.enums import AttnMaskType, LayerType
+from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.multi_latent_attention import (
+    FusedMLASelfAttention,
+    MLASelfAttention,
+    MLASelfAttentionSubmodules,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.quantization.utils import get_quant_config_or_none
-from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
-from megatron.core.transformer.enums import CudaGraphScope, ModelType
 from megatron.core.transformer.multi_token_prediction import (
-    MultiTokenPredictionBlock,
-    mtp_on_this_rank,
-    process_mtp_loss,
+    MultiTokenPredictionBlockSubmodules,
+    get_mtp_layer_offset,
+    get_mtp_layer_spec_for_backend,
+    get_mtp_num_layers_to_build,
 )
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_block import TransformerBlock
-from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import (
-    WrappedTensor,
-    deprecate_inference_params,
-    is_using_quantization_scales,
+from megatron.core.transformer.torch_norm import L2Norm
+from megatron.core.transformer.transformer_block import (
+    TransformerBlockSubmodules,
+    get_num_layers_to_build,
 )
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import (
+    TransformerLayer,
+    TransformerLayerSubmodules,
+    get_transformer_layer_offset,
+)
+from megatron.core.typed_torch import copy_signature
+from megatron.core.utils import is_te_min_version
+
+if HAVE_TE:
+    from megatron.core.extensions.transformer_engine import TEFusedMLP, TENorm
+    from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+else:
+    TEFusedMLP, TENorm, TESpecProvider = None, None, None
+
+try:
+    from megatron.core.extensions.kitchen import HAVE_KITCHEN, KitchenSpecProvider
+
+except ImportError:
+    HAVE_KITCHEN = False
+
+try:
+    import apex  # type: ignore[import-untyped]  # pylint: disable=unused-import
+
+    from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
+
+    HAVE_APEX = True
+    LNImpl = FusedLayerNorm
+except ImportError:
+    import warnings
+
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
+
+    warnings.warn("Apex is not installed. Falling back to Torch Norm")
+    LNImpl = WrappedTorchNorm
+    HAVE_APEX = False
 
 
-class GPTModel(LanguageModule):
-    """GPT Transformer language model.
+def get_gpt_layer_with_inference_submodules(
+    qk_layernorm: Optional[bool] = False,
+    multi_latent_attention: Optional[bool] = False,
+    qk_l2_norm: Optional[bool] = False,
+    num_experts: Optional[int] = None,
+    moe_grouped_gemm: Optional[bool] = False,
+    moe_use_legacy_grouped_gemm: Optional[bool] = False,
+) -> TransformerLayerSubmodules:
+    """Use these submodules for inference optimized linear layers.
+    Args:
+        qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
+        multi_latent_attention (bool, optional): To use MLA. Defaults to False.
+        qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
+    """
+    assert HAVE_TE, "--transformer-impl inference_optimized requires transformer engine"
+    backend = InferenceSpecProvider()
+
+    mlp = get_mlp_module_spec_for_backend(
+        backend=backend,
+        num_experts=num_experts,
+        moe_grouped_gemm=moe_grouped_gemm,
+        use_te_op_fuser=False,
+        use_te_activation_func=False,
+    )
+
+    if multi_latent_attention:
+        assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
+        linear_q_up_proj = (
+            backend.column_parallel_layer_norm_linear()
+            if qk_layernorm
+            else backend.column_parallel_linear()
+        )
+        linear_kv_up_proj = (
+            backend.column_parallel_layer_norm_linear()
+            if qk_layernorm
+            else backend.column_parallel_linear()
+        )
+        return TransformerLayerSubmodules(
+            input_layernorm=backend.layer_norm(has_residual=True),
+            self_attention=ModuleSpec(
+                module=MLASelfAttention,
+                params={"attn_mask_type": AttnMaskType.causal},
+                submodules=MLASelfAttentionSubmodules(
+                    linear_q_proj=backend.column_parallel_linear(),
+                    linear_q_down_proj=backend.linear(),
+                    linear_q_up_proj=linear_q_up_proj,
+                    linear_kv_down_proj=backend.linear(),
+                    linear_kv_up_proj=linear_kv_up_proj,
+                    core_attention=backend.core_attention(),
+                    linear_proj=backend.row_parallel_linear(),
+                    q_layernorm=IdentityOp,
+                    kv_layernorm=IdentityOp,
+                ),
+            ),
+            self_attn_bda=get_bias_dropout_add,
+            pre_mlp_layernorm=IdentityOp,
+            mlp=mlp,
+            mlp_bda=get_bias_dropout_add,
+        )
+    else:
+        qk_norm = backend.layer_norm(for_qk=True)
+        return TransformerLayerSubmodules(
+            self_attention=ModuleSpec(
+                module=SelfAttention,
+                params={"attn_mask_type": AttnMaskType.causal},
+                submodules=SelfAttentionSubmodules(
+                    linear_qkv=backend.column_parallel_layer_norm_linear(),
+                    core_attention=backend.core_attention(),
+                    linear_proj=backend.row_parallel_linear(),
+                    q_layernorm=(
+                        L2Norm if qk_l2_norm else (qk_norm if qk_layernorm else IdentityOp)
+                    ),
+                    k_layernorm=(
+                        L2Norm if qk_l2_norm else (qk_norm if qk_layernorm else IdentityOp)
+                    ),
+                ),
+            ),
+            self_attn_bda=get_bias_dropout_add,
+            pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
+            mlp=mlp,
+            mlp_bda=get_bias_dropout_add,
+            sharded_state_dict_keys_map={
+                "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
+                "mlp.0.bias": "mlp.linear_fc1.layer_norm_bias",
+                "mlp.1.basic_ops.0.weight": "mlp.linear_fc1.weight",
+                "mlp.1.basic_ops.1.bias": "mlp.linear_fc1.bias",
+                "mlp.3.basic_ops.0.weight": "mlp.linear_fc2.weight",
+                "mlp.3.basic_ops.1.bias": "mlp.linear_fc2.bias",
+            },
+        )
+
+
+@copy_signature(get_gpt_layer_with_inference_submodules)
+def get_gpt_layer_with_inference_spec(*args, **kwargs) -> ModuleSpec:
+    """Use this spec to use inference optimized linear layers."""
+    return ModuleSpec(
+        module=TransformerLayer, submodules=get_gpt_layer_with_inference_submodules(*args, **kwargs)
+    )
+
+
+def get_gpt_layer_with_transformer_engine_submodules(
+    num_experts: Optional[int] = None,
+    moe_grouped_gemm: Optional[bool] = False,
+    qk_layernorm: Optional[bool] = False,
+    multi_latent_attention: Optional[bool] = False,
+    fp8: Optional[str] = None,  # pylint: disable=unused-argument
+    qk_l2_norm: Optional[bool] = False,
+    use_te_op_fuser: Optional[bool] = False,
+    use_kitchen: bool = False,
+    use_te_activation_func: bool = False,
+    use_kitchen_attention: bool = False,
+    kitchen_attention_backend: str = "sdpa",
+    mla_down_proj_fusion: bool = False,
+    te_fuse_layernorm_linear: bool = True,
+    normalization: Optional[str] = None,
+) -> TransformerLayerSubmodules:
+    """Use these submodules to use lower-level Transformer Engine modules (required for fp8
+    training).
+
 
     Args:
-        config (TransformerConfig):
-            Transformer config
-        transformer_layer_spec (ModuleSpec):
-            Specifies module to use for transformer layers
-        vocab_size (int):
-            Vocabulary size
-        max_sequence_length (int):
-            maximum size of sequence. This is used for positional embedding
-        pre_process (bool, optional):
-            Include embedding layer (used with pipeline parallelism). Defaults to True.
-        post_process (bool, optional):
-            Include an output layer (used with pipeline parallelism). Defaults to True.
-        fp16_lm_cross_entropy (bool, optional):
-            Defaults to False.
-        parallel_output (bool, optional):
-            Do not gather the outputs, keep them split across tensor
-            parallel ranks. Defaults to True.
-        share_embeddings_and_output_weights (bool, optional):
-            When True, input embeddings and output logit weights are shared. Defaults to False.
-        position_embedding_type (Literal[learned_absolute,rope], optional):
-            Position embedding type.. Defaults to 'learned_absolute'.
-        rotary_percent (float, optional):
-            Percent of rotary dimension to use for rotary position embeddings.
-            Ignored unless position_embedding_type is 'rope'. Defaults to 1.0.
-        rotary_base (int, optional):
-            Base period for rotary position embeddings. Ignored unless
-            position_embedding_type is 'rope'.
-            Defaults to 10000.
-        rope_scaling (bool, optional): Toggle RoPE scaling.
-        rope_scaling_factor (float): RoPE scaling factor. Default 8.
-        scatter_embedding_sequence_parallel (bool, optional):
-            Whether embeddings should be scattered across sequence parallel
-            region or not. Defaults to True.
-        seq_len_interpolation_factor (Optional[float], optional):
-            scale of linearly interpolating RoPE for longer sequences.
-            The value must be a float larger than 1.0. Defaults to None.
-        pg_collection (ProcessGroupCollection): Model communication process groups
+        num_experts (int, optional): Number of experts. Defaults to None.
+        moe_grouped_gemm (bool, optional): To use Grouped GEMM. Defaults to False.
+        qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
+        multi_latent_attention (bool, optional): To use MLA. Defaults to False.
+        fp8 (str, optional): Deprecated. For temporary Nemo compatibility.
+        qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
+        use_te_op_fuser (bool, optional): Use Transformer Engine's operation-based API, which may
+                                          enable certain operation fusions. Defaults to False.
+        mla_down_proj_fusion (bool, optional): Enable fused q/kv down-projection and fused input
+                                               layernorm when backend supports. Otherwise fall back
+                                               to the unfused MLA.
+
+    Returns:
+        TransformerLayerSubmodules: TE modules to construct a TransformerLayer
+
+    """
+    if fp8 is not None:
+        warnings.warn(
+            'The fp8 argument in "get_gpt_layer_with_transformer_engine_spec" has been deprecated'
+            " and will be removed soon. Please update your code accordingly."
+        )
+
+    if use_kitchen:
+        assert HAVE_KITCHEN
+        backend: BackendSpecProvider = KitchenSpecProvider(
+            fallback=TESpecProvider(),
+            use_kitchen_attention=use_kitchen_attention,
+            kitchen_attention_backend=kitchen_attention_backend,
+        )
+        if use_te_op_fuser:
+            raise AssertionError("use_te_op_fuser not compatible with using kitchen in mlp.")
+        if use_te_activation_func:
+            raise AssertionError("use_te_activation_func not compatible with using kitchen.")
+    else:
+        backend = TESpecProvider(fuse_layernorm_linear=te_fuse_layernorm_linear)
+
+    # Profiling mode can keep TE linears/attention while routing the two pre-linear
+    # norms through local implementations so they are not swallowed by TE fused norm+linear modules.
+    local_norm_backend = LocalSpecProvider()
+
+    mlp = get_mlp_module_spec_for_backend(
+        backend=backend,
+        num_experts=num_experts,
+        moe_grouped_gemm=moe_grouped_gemm,
+        use_te_op_fuser=use_te_op_fuser,
+        use_te_activation_func=use_te_activation_func,
+    )
+
+    if multi_latent_attention:
+        assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
+        linear_q_up_proj = (
+            backend.column_parallel_layer_norm_linear()
+            if qk_layernorm
+            else backend.column_parallel_linear()
+        )
+        linear_kv_up_proj = (
+            backend.column_parallel_layer_norm_linear()
+            if qk_layernorm
+            else backend.column_parallel_linear()
+        )
+
+        if mla_down_proj_fusion:
+            fuse_input_layernorm = backend.column_parallel_layer_norm_linear() is not None
+            input_layernorm = IdentityOp if fuse_input_layernorm else backend.layer_norm()
+            down_proj_linear = (
+                backend.column_parallel_layer_norm_linear()
+                if fuse_input_layernorm
+                else backend.linear()
+            )
+            return TransformerLayerSubmodules(
+                input_layernorm=input_layernorm,
+                self_attention=ModuleSpec(
+                    module=FusedMLASelfAttention,
+                    params={"attn_mask_type": AttnMaskType.causal},
+                    submodules=MLASelfAttentionSubmodules(
+                        linear_q_proj=backend.column_parallel_linear(),
+                        linear_qkv_down_proj=down_proj_linear,
+                        linear_q_up_proj=linear_q_up_proj,
+                        linear_kv_up_proj=linear_kv_up_proj,
+                        core_attention=backend.core_attention(),
+                        linear_proj=backend.row_parallel_linear(),
+                        q_layernorm=IdentityOp,
+                        kv_layernorm=IdentityOp,
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
+                pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
+                mlp=mlp,
+                mlp_bda=get_bias_dropout_add,
+                sharded_state_dict_keys_map=(
+                    {
+                        "self_attention.linear_q_down_proj.layer_norm_": "input_layernorm.",
+                        "self_attention.linear_kv_down_proj.layer_norm_": "input_layernorm.",
+                        "self_attention.linear_qkv_down_proj.layer_norm_": "input_layernorm.",
+                    }
+                    if fuse_input_layernorm
+                    else {}
+                ),
+            )
+        return TransformerLayerSubmodules(
+            input_layernorm=backend.layer_norm(has_residual=True),
+            self_attention=ModuleSpec(
+                module=MLASelfAttention,
+                params={"attn_mask_type": AttnMaskType.causal},
+                submodules=MLASelfAttentionSubmodules(
+                    linear_q_proj=backend.column_parallel_linear(),
+                    linear_q_down_proj=backend.linear(),
+                    linear_q_up_proj=linear_q_up_proj,
+                    linear_kv_down_proj=backend.linear(),
+                    linear_kv_up_proj=linear_kv_up_proj,
+                    core_attention=backend.core_attention(),
+                    linear_proj=backend.row_parallel_linear(),
+                    q_layernorm=IdentityOp,
+                    kv_layernorm=IdentityOp,
+                ),
+            ),
+            self_attn_bda=get_bias_dropout_add,
+            pre_mlp_layernorm=backend.layer_norm(has_residual=True) if num_experts else IdentityOp,
+            mlp=mlp,
+            mlp_bda=get_bias_dropout_add,
+        )
+    else:
+        qk_norm = backend.layer_norm(for_qk=True)
+        pre_linear_norm = (
+            local_norm_backend.layer_norm(rms_norm=normalization == "RMSNorm", has_residual=True)
+            if not backend.fuse_layernorm_and_linear()
+            else backend.layer_norm(has_residual=True)
+        )
+        linear_qkv = (
+            backend.column_parallel_layer_norm_linear()
+            if backend.fuse_layernorm_and_linear()
+            else backend.column_parallel_linear()
+        )
+        input_layernorm = IdentityOp if backend.fuse_layernorm_and_linear() else pre_linear_norm
+        pre_mlp_layernorm = (
+            pre_linear_norm
+            if (num_experts or not backend.fuse_layernorm_and_linear())
+            else IdentityOp
+        )
+        return TransformerLayerSubmodules(
+            input_layernorm=input_layernorm,
+            self_attention=ModuleSpec(
+                module=SelfAttention,
+                params={"attn_mask_type": AttnMaskType.causal},
+                submodules=SelfAttentionSubmodules(
+                    linear_qkv=linear_qkv,
+                    core_attention=backend.core_attention(),
+                    linear_proj=backend.row_parallel_linear(),
+                    q_layernorm=(
+                        L2Norm if qk_l2_norm else (qk_norm if qk_layernorm else IdentityOp)
+                    ),
+                    k_layernorm=(
+                        L2Norm if qk_l2_norm else (qk_norm if qk_layernorm else IdentityOp)
+                    ),
+                ),
+            ),
+            self_attn_bda=get_bias_dropout_add,
+            pre_mlp_layernorm=pre_mlp_layernorm,
+            mlp=mlp,
+            mlp_bda=get_bias_dropout_add,
+            sharded_state_dict_keys_map=(
+                {
+                    "input_layernorm.": "self_attention.linear_qkv.layer_norm_",
+                    "pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_",
+                    "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
+                    "mlp.0.bias": "mlp.linear_fc1.layer_norm_bias",
+                    "mlp.1.basic_ops.0.weight": "mlp.linear_fc1.weight",
+                    "mlp.1.basic_ops.1.bias": "mlp.linear_fc1.bias",
+                    "mlp.3.basic_ops.0.weight": "mlp.linear_fc2.weight",
+                    "mlp.3.basic_ops.1.bias": "mlp.linear_fc2.bias",
+                }
+                if backend.fuse_layernorm_and_linear()
+                else {}
+            ),
+        )
+
+
+@copy_signature(get_gpt_layer_with_transformer_engine_submodules)
+def get_gpt_layer_with_transformer_engine_spec(*args, **kwargs) -> ModuleSpec:
+    """Use this spec to use lower-level Transformer Engine modules (required for fp8 training)."""
+    return ModuleSpec(
+        module=TransformerLayer,
+        submodules=get_gpt_layer_with_transformer_engine_submodules(*args, **kwargs),
+    )
+
+
+def get_gpt_layer_local_submodules(
+    num_experts: Optional[int] = None,
+    moe_grouped_gemm: Optional[bool] = False,
+    qk_layernorm: Optional[bool] = False,
+    multi_latent_attention: Optional[bool] = False,
+    fp8: Optional[str] = None,  # pylint: disable=unused-argument
+    normalization: Optional[str] = None,
+    qk_l2_norm: Optional[bool] = False,
+    use_kitchen: bool = False,
+    use_kitchen_attention: bool = False,
+    kitchen_attention_backend: str = "sdpa",
+) -> TransformerLayerSubmodules:
+    """Use these submodules for an implementation using only modules in Megatron-Core.
+
+
+    Args:
+        num_experts (int, optional): Number of experts. Defaults to None.
+        moe_grouped_gemm (bool, optional): To use Grouped GEMM. Defaults to False.
+        qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
+        multi_latent_attention (bool, optional): To use MLA. Defaults to False.
+        fp8 (str, optional): Deprecated. For temporary Nemo compatibility.
+        qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
+
+    Returns:
+        TransformerLayerSubmodules: Megatron-Core modules to construct a TransformerLayer
     """
 
-    def __init__(
-        self,
-        config: TransformerConfig,
-        transformer_layer_spec: ModuleSpec,
-        vocab_size: int,
-        max_sequence_length: int,
-        pre_process: bool = True,
-        post_process: bool = True,
-        fp16_lm_cross_entropy: bool = False,
-        parallel_output: bool = True,
-        share_embeddings_and_output_weights: bool = False,
-        position_embedding_type: Literal[
-            'learned_absolute', 'rope', 'mrope', 'yarn', 'none'
-        ] = 'learned_absolute',
-        rotary_percent: float = 1.0,
-        rotary_base: int = 10000,
-        rope_scaling: bool = False,
-        rope_scaling_factor: float = 8.0,
-        scatter_embedding_sequence_parallel: bool = True,
-        seq_len_interpolation_factor: Optional[float] = None,
-        mtp_block_spec: Optional[ModuleSpec] = None,
-        pg_collection: Optional[ProcessGroupCollection] = None,
-        vp_stage: Optional[int] = None,
-    ) -> None:
-        super().__init__(config=config, pg_collection=pg_collection)
+    if use_kitchen:
+        assert HAVE_KITCHEN
+        backend = KitchenSpecProvider(
+            fallback=LocalSpecProvider(),
+            use_kitchen_attention=use_kitchen_attention,
+            kitchen_attention_backend=kitchen_attention_backend,
+        )
+    else:
+        backend = LocalSpecProvider()
+    # Adjust for RMS norm.
+    if normalization == "RMSNorm":
+        layer_norm = backend.layer_norm(rms_norm=True, for_qk=False, has_residual=True)
+        qk_norm = backend.layer_norm(rms_norm=True, for_qk=True)
+    else:
+        layer_norm = backend.layer_norm(rms_norm=False, for_qk=False, has_residual=True)
+        qk_norm = backend.layer_norm(rms_norm=False, for_qk=True)
 
-        if has_config_logger_enabled(config):
-            log_config_to_disk(config, locals(), prefix=type(self).__name__)
-
-        self.transformer_layer_spec: ModuleSpec = transformer_layer_spec
-        self.vocab_size = vocab_size
-        self.max_sequence_length = max_sequence_length
-        self.pre_process = pre_process
-        self.post_process = post_process
-        self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
-        self.parallel_output = parallel_output
-        self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
-        self.vp_stage = vp_stage
-        self.disable_param_offloading = True
-
-        if hasattr(self.config, 'position_embedding_type'):
-            self.position_embedding_type = self.config.position_embedding_type
-        else:
-            self.position_embedding_type = position_embedding_type
-
-        # megatron core pipelining currently depends on model type
-        # TODO: remove this dependency ?
-        self.model_type = ModelType.encoder_or_decoder
-
-        # These 4 attributes are needed for TensorRT-LLM export.
-        self.max_position_embeddings = max_sequence_length
-        self.rotary_percent = rotary_percent
-
-        if hasattr(self.config, 'rotary_base'):
-            self.rotary_base = self.config.rotary_base
-        else:
-            self.rotary_base = rotary_base
-        self.rotary_scaling = rope_scaling
-        self.mtp_block_spec = mtp_block_spec
-        self.mtp_process = mtp_block_spec is not None and mtp_on_this_rank(
-            self.config, ignore_virtual=False, vp_stage=vp_stage
+    if fp8 is not None:
+        warnings.warn(
+            'The fp8 argument in "get_gpt_layer_local_spec" has been deprecated'
+            " and will be removed soon. Please update your code accordingly."
         )
 
-        if self.pre_process or self.mtp_process:
-            self.embedding = LanguageModelEmbedding(
-                config=self.config,
-                vocab_size=self.vocab_size,
-                max_sequence_length=self.max_sequence_length,
-                position_embedding_type=position_embedding_type,
-                scatter_to_sequence_parallel=scatter_embedding_sequence_parallel,
-                tp_group=self.pg_collection.tp,
-            )
+    mlp = get_mlp_module_spec_for_backend(
+        backend=backend, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm
+    )
 
-        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
-            self.rotary_pos_emb = RotaryEmbedding(
-                kv_channels=self.config.kv_channels,
-                rotary_percent=rotary_percent,
-                rotary_interleaved=self.config.rotary_interleaved,
-                seq_len_interpolation_factor=seq_len_interpolation_factor,
-                rotary_base=rotary_base,
-                rope_scaling=rope_scaling,
-                rope_scaling_factor=rope_scaling_factor,
-                use_cpu_initialization=self.config.use_cpu_initialization,
-                cp_group=self.pg_collection.cp,
-            )
-
-        elif self.position_embedding_type == 'yarn':
-            self.rotary_pos_emb = YarnRotaryEmbedding(
-                kv_channels=self.config.kv_channels,
-                rotary_percent=rotary_percent,
-                rotary_interleaved=self.config.rotary_interleaved,
-                seq_len_interpolation_factor=seq_len_interpolation_factor,
-                rotary_base=rotary_base,
-                scaling_factor=getattr(self.config, "yarn_rotary_scaling_factor"),
-                original_max_position_embeddings=getattr(
-                    self.config, "yarn_original_max_position_embeddings"
+    if multi_latent_attention:
+        assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
+        return TransformerLayerSubmodules(
+            input_layernorm=layer_norm,
+            self_attention=ModuleSpec(
+                module=MLASelfAttention,
+                params={"attn_mask_type": AttnMaskType.causal},
+                submodules=MLASelfAttentionSubmodules(
+                    linear_q_proj=backend.column_parallel_linear(),
+                    linear_q_down_proj=backend.column_parallel_linear(),
+                    linear_q_up_proj=backend.column_parallel_linear(),
+                    linear_kv_down_proj=backend.column_parallel_linear(),
+                    linear_kv_up_proj=backend.column_parallel_linear(),
+                    core_attention=backend.core_attention(),
+                    linear_proj=backend.row_parallel_linear(),
+                    q_layernorm=qk_norm if qk_layernorm else IdentityOp,
+                    kv_layernorm=qk_norm if qk_layernorm else IdentityOp,
                 ),
-                beta_fast=getattr(self.config, "yarn_beta_fast"),
-                beta_slow=getattr(self.config, "yarn_beta_slow"),
-                mscale=getattr(self.config, "yarn_mscale"),
-                mscale_all_dim=getattr(self.config, "yarn_mscale_all_dim"),
-                correction_range_round_to_int=getattr(
-                    self.config, "yarn_correction_range_round_to_int"
+            ),
+            self_attn_bda=get_bias_dropout_add,
+            pre_mlp_layernorm=layer_norm,
+            mlp=mlp,
+            mlp_bda=get_bias_dropout_add,
+        )
+    else:
+        return TransformerLayerSubmodules(
+            input_layernorm=layer_norm,
+            self_attention=ModuleSpec(
+                module=SelfAttention,
+                params={"attn_mask_type": AttnMaskType.causal},
+                submodules=SelfAttentionSubmodules(
+                    linear_qkv=backend.column_parallel_linear(),
+                    core_attention=backend.core_attention(),
+                    linear_proj=backend.row_parallel_linear(),
+                    q_layernorm=(
+                        L2Norm if qk_l2_norm else (qk_norm if qk_layernorm else IdentityOp)
+                    ),
+                    k_layernorm=(
+                        L2Norm if qk_l2_norm else (qk_norm if qk_layernorm else IdentityOp)
+                    ),
                 ),
-                use_cpu_initialization=self.config.use_cpu_initialization,
-            )
-        elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
-            self.rotary_pos_emb = MultimodalRotaryEmbedding(
-                kv_channels=self.config.kv_channels,
-                rotary_percent=rotary_percent,
-                rotary_interleaved=self.config.rotary_interleaved,
-                seq_len_interpolation_factor=seq_len_interpolation_factor,
-                rotary_base=rotary_base,
-            )
-            self.mrope_section = self.config.mrope_section
-            assert (
-                self.mrope_section is not None
-            ), "mrope require mrope_section setting, but we got None from TransformerConfig"
-
-        # Cache for RoPE tensors which do not change between iterations.
-        self.rotary_pos_emb_cache = {}
-
-        # Transformer.
-        self.decoder = TransformerBlock(
-            config=self.config,
-            spec=transformer_layer_spec,
-            pre_process=self.pre_process,
-            post_process=self.post_process,
-            pg_collection=self.pg_collection,
-            vp_stage=vp_stage,
+            ),
+            self_attn_bda=get_bias_dropout_add,
+            pre_mlp_layernorm=layer_norm,
+            mlp=mlp,
+            mlp_bda=get_bias_dropout_add,
+            sharded_state_dict_keys_map={
+                "input_layernorm.": "self_attention.linear_qkv.layer_norm_",
+                "pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_",
+            },
         )
 
-        if self.mtp_process:
-            self.mtp = MultiTokenPredictionBlock(
-                config=self.config,
-                spec=self.mtp_block_spec,
-                vp_stage=vp_stage,
-                pg_collection=self.pg_collection,
+
+@copy_signature(get_gpt_layer_local_submodules)
+def get_gpt_layer_local_spec(*args, **kwargs) -> ModuleSpec:
+    """Use this spec for an implementation using only modules in Megatron-Core."""
+    return ModuleSpec(
+        module=TransformerLayer, submodules=get_gpt_layer_local_submodules(*args, **kwargs)
+    )
+
+
+def _get_mlp_module_spec(
+    use_te: Optional[bool] = True,
+    num_experts: Optional[int] = None,
+    moe_grouped_gemm: Optional[bool] = False,
+    fp8: Optional[str] = None,  # pylint: disable=unused-argument
+):
+    warnings.warn(
+        """This private function is on a deprecation track. Please switch to `get_mlp_module_spec`
+        since it will be removed in a future release."""
+    )
+
+    return get_mlp_module_spec(
+        use_te=use_te, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm, fp8=fp8
+    )
+
+
+def get_mlp_module_spec(
+    use_te: Optional[bool] = True,
+    num_experts: Optional[int] = None,
+    moe_grouped_gemm: Optional[bool] = False,
+    fp8: Optional[str] = None,  # pylint: disable=unused-argument
+    use_te_op_fuser: Optional[bool] = False,
+) -> ModuleSpec:
+    """Helper function to get module spec for MLP/MoE"""
+    if fp8 is not None:
+        warnings.warn(
+            'The fp8 argument in "_get_mlp_module_spec" has been deprecated'
+            " and will be removed soon. Please update your code accordingly."
+        )
+    if use_te_op_fuser:
+        if not is_te_min_version("1.13.0"):
+            raise ValueError(
+                "Transformer Engine operation-based API requires Transformer Engine 1.13+"
+            )
+        if num_experts is not None:
+            raise ValueError(
+                "Transformer Engine operation-based API does not support mixture-of-experts"
             )
 
-        # Output
-        if self.post_process:
+    return get_mlp_module_spec_for_backend(
+        backend=TESpecProvider() if use_te else LocalSpecProvider(),
+        num_experts=num_experts,
+        moe_grouped_gemm=moe_grouped_gemm,
+        use_te_op_fuser=use_te_op_fuser,
+    )
 
-            if self.config.defer_embedding_wgrad_compute:
-                # The embedding activation buffer preserves a reference to the input activations
-                # of the final embedding projection layer GEMM. It will hold the activations for
-                # all the micro-batches of a global batch for the last pipeline stage. Once we are
-                # done with all the back props for all the microbatches for the last pipeline stage,
-                # it will be in the pipeline flush stage. During this pipeline flush we use the
-                # input activations stored in embedding activation buffer and gradient outputs
-                # stored in gradient buffer to calculate the weight gradients for the embedding
-                # final linear layer.
-                self.embedding_activation_buffer = []
-                self.grad_output_buffer = []
-            else:
-                self.embedding_activation_buffer = None
-                self.grad_output_buffer = None
 
-            self.output_layer = tensor_parallel.ColumnParallelLinear(
-                config.hidden_size,
-                self.vocab_size,
-                config=config,
-                init_method=(
-                    config.embedding_init_method
-                    if config.use_mup and not self.share_embeddings_and_output_weights
-                    else config.init_method
-                ),
-                bias=False,
-                skip_bias_add=False,
-                gather_output=not self.parallel_output,
-                skip_weight_param_allocation=self.pre_process
-                and self.share_embeddings_and_output_weights,
-                embedding_activation_buffer=self.embedding_activation_buffer,
-                grad_output_buffer=self.grad_output_buffer,
-                tp_group=self.pg_collection.tp,
-            )
+def get_mlp_module_spec_for_backend(
+    backend: BackendSpecProvider,
+    num_experts: Optional[int] = None,
+    moe_grouped_gemm: Optional[bool] = False,
+    use_te_op_fuser: Optional[bool] = False,
+    use_te_activation_func: bool = False,
+) -> ModuleSpec:
+    """Helper function to get module spec for MLP/MoE"""
 
-        if self.pre_process or self.post_process or self.mtp_process:
-            self.setup_embeddings_and_output_layer()
+    linear_fc2 = backend.row_parallel_linear()
+    activation_func = backend.activation_func() if use_te_activation_func else None
 
-        if has_config_logger_enabled(self.config):
-            log_config_to_disk(
-                self.config, self.state_dict(), prefix=f'{type(self).__name__}_init_ckpt'
-            )
-        for name, module in self.named_modules():
-            if hasattr(module, 'finish_init'):
-                quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
-                module.finish_init(quant_config)
-
-    def set_input_tensor(self, input_tensor: Tensor) -> None:
-        """Sets input tensor to the model.
-
-        See megatron.model.transformer.set_input_tensor()
-
-        Args:
-            input_tensor (Tensor): Sets the input tensor for the model.
-        """
-        # This is usually handled in schedules.py but some inference code still
-        # gives us non-lists or None
-        if not isinstance(input_tensor, list):
-            input_tensor = [input_tensor]
-
-        assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
-        self.decoder.set_input_tensor(input_tensor[0])
-
-    def _preprocess(
-        self,
-        input_ids: Tensor,
-        position_ids: Tensor,
-        decoder_input: Tensor = None,
-        inference_context: BaseInferenceContext = None,
-        packed_seq_params: PackedSeqParams = None,
-        padding_mask: Optional[Tensor] = None,
-    ):
-        """Preprocesses inputs for the transformer decoder.
-
-        Applies embeddings to input tokens, or uses `decoder_input` from a previous
-        pipeline stage. Also sets up rotary positional embeddings.
-        """
-
-        # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
-        # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
-
-        in_inference_mode = inference_context is not None and not self.training
-
-        # Decoder embedding.
-        if decoder_input is not None:
-            pass
-        elif self.pre_process:
-            if padding_mask is not None:
-                assert padding_mask.shape == input_ids.shape, (
-                    f"padding_mask shape {padding_mask.shape} does not match "
-                    f"input_ids shape {input_ids.shape}"
-                )
-            decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
-            if padding_mask is not None and self.config.sequence_parallel:
-                padding_mask = (
-                    tensor_parallel.scatter_to_sequence_parallel_region(
-                        padding_mask.transpose(0, 1).contiguous()
-                    )
-                    .transpose(0, 1)
-                    .contiguous()
-                )
+    if num_experts is None:
+        # Dense MLP w/ or w/o TE modules.
+        module = TEFusedMLP if use_te_op_fuser else MLP
+        if backend.fuse_layernorm_and_linear():
+            linear_fc1 = backend.column_parallel_layer_norm_linear()
+            assert linear_fc1 is not None
         else:
-            # intermediate stage of pipeline
-            # decoder will get hidden_states from encoder.input_tensor
-            decoder_input = None
+            linear_fc1 = backend.column_parallel_linear()
+        return ModuleSpec(
+            module=module,
+            submodules=MLPSubmodules(
+                linear_fc1=linear_fc1, linear_fc2=linear_fc2, activation_func=activation_func
+            ),
+        )
+    else:
+        # Mixture of experts with modules in megatron core.
+        return get_moe_module_spec_for_backend(
+            backend=backend,
+            num_experts=num_experts,
+            moe_grouped_gemm=moe_grouped_gemm,
+            use_te_activation_func=use_te_activation_func,
+        )
 
-        # Rotary positional embeddings (embedding is None for PP intermediate devices)
-        rotary_pos_emb = None
-        rotary_pos_cos = None
-        rotary_pos_sin = None
-        # this is used to store combined cos/sin embeddings, exclusively for flash infer rope
-        rotary_pos_cos_sin = None
 
-        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
-            use_flash_infer_fused_rope = (
-                hasattr(inference_context, 'use_flashinfer_fused_rope')
-                and inference_context.use_flashinfer_fused_rope
-            )
-            if in_inference_mode and (self.config.flash_decode or use_flash_infer_fused_rope):
-                assert (
-                    not self.config.flash_decode
-                ) or inference_context.is_static_batching(), (
-                    "Flash decode is only applicable to static batching."
-                )
-                # Flash decoding uses precomputed cos and sin for RoPE
-                if self.config.flash_decode:
-                    rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb_cache.setdefault(
-                        inference_context.max_sequence_length,
-                        self.rotary_pos_emb.get_cos_sin(inference_context.max_sequence_length),
-                    )
-                elif use_flash_infer_fused_rope:
-                    assert not self.mtp_process, "MTP not tested with flashinfer_fused_rope"
-                    rotary_pos_cos_sin = self.rotary_pos_emb_cache.setdefault(
-                        inference_context.max_sequence_length,
-                        torch.cat(
-                            self.rotary_pos_emb.get_cos_sin(inference_context.max_sequence_length),
-                            -1,
-                        ),
-                    )
-            else:
-                rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                    inference_context, self.decoder, decoder_input, self.config, packed_seq_params
-                )
-                rotary_pos_emb = self.rotary_pos_emb(
-                    rotary_seq_len,
-                    packed_seq=packed_seq_params is not None
-                    and packed_seq_params.qkv_format == 'thd',
-                    cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
-                )
-        elif self.position_embedding_type == 'yarn':
-            if self.training or not self.config.flash_decode:
-                rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                    inference_context, self.decoder, decoder_input, self.config, packed_seq_params
-                )
-                rotary_pos_emb, _ = self.rotary_pos_emb(
-                    rotary_seq_len,
-                    packed_seq=packed_seq_params is not None
-                    and packed_seq_params.qkv_format == 'thd',
-                    cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
-                )
-            else:
-                raise NotImplementedError(
-                    "Flash decoding uses precomputed cos and sin for RoPE, not implemented in "
-                    "YarnRotaryEmbedding yet."
-                )
-        elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
-            if self.training or not self.config.flash_decode:
-                rotary_pos_emb = self.rotary_pos_emb(
-                    position_ids,
-                    self.mrope_section,
-                    cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
-                )
-            else:
-                # Flash decoding uses precomputed cos and sin for RoPE
-                raise NotImplementedError(
-                    "Flash decoding uses precomputed cos and sin for RoPE, not implemented in "
-                    "MultimodalRotaryEmbedding yet."
-                )
+def get_gpt_decoder_layer_specs(
+    config: TransformerConfig,
+    use_transformer_engine: bool,
+    normalization: Optional[str] = None,
+    qk_l2_norm: Optional[bool] = False,
+    vp_stage: Optional[int] = None,
+    pp_rank: Optional[int] = None,
+) -> TransformerBlockSubmodules:
+    """GPT block spec."""
+    if use_transformer_engine:
+        layer_norm_impl = TENorm
+        dense_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            num_experts=None,
+            moe_grouped_gemm=False,
+            qk_layernorm=config.qk_layernorm,
+            multi_latent_attention=config.multi_latent_attention,
+            qk_l2_norm=qk_l2_norm,
+            use_kitchen=config.use_kitchen,
+            use_te_activation_func=config.use_te_activation_func,
+            use_kitchen_attention=config.use_kitchen_attention,
+            kitchen_attention_backend=config.kitchen_attention_backend,
+            mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
+            te_fuse_layernorm_linear=config.te_fuse_layernorm_linear,
+            normalization=config.normalization,
+        )
+        moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            num_experts=config.num_moe_experts,
+            moe_grouped_gemm=config.moe_grouped_gemm,
+            qk_layernorm=config.qk_layernorm,
+            multi_latent_attention=config.multi_latent_attention,
+            qk_l2_norm=qk_l2_norm,
+            use_kitchen=config.use_kitchen,
+            use_te_activation_func=config.use_te_activation_func,
+            use_kitchen_attention=config.use_kitchen_attention,
+            kitchen_attention_backend=config.kitchen_attention_backend,
+            mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
+            te_fuse_layernorm_linear=config.te_fuse_layernorm_linear,
+            normalization=config.normalization,
+        )
+    elif config.transformer_impl == "inference_optimized":
+        layer_norm_impl = TENorm
+        dense_layer_spec = get_gpt_layer_with_inference_spec(
+            qk_layernorm=config.qk_layernorm,
+            multi_latent_attention=config.multi_latent_attention,
+            qk_l2_norm=qk_l2_norm,
+        )
+        moe_layer_spec = get_gpt_layer_with_inference_spec(
+            qk_layernorm=config.qk_layernorm,
+            multi_latent_attention=config.multi_latent_attention,
+            qk_l2_norm=qk_l2_norm,
+            num_experts=config.num_moe_experts,
+            moe_grouped_gemm=config.moe_grouped_gemm,
+            moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
+        )
+    else:
+        layer_norm_impl = LNImpl
+        dense_layer_spec = get_gpt_layer_local_spec(
+            num_experts=None,
+            moe_grouped_gemm=False,
+            qk_layernorm=config.qk_layernorm,
+            multi_latent_attention=config.multi_latent_attention,
+            normalization=normalization,
+            qk_l2_norm=qk_l2_norm,
+            use_kitchen=config.use_kitchen,
+            use_kitchen_attention=config.use_kitchen_attention,
+            kitchen_attention_backend=config.kitchen_attention_backend,
+        )
+        moe_layer_spec = get_gpt_layer_local_spec(
+            num_experts=config.num_moe_experts,
+            moe_grouped_gemm=config.moe_grouped_gemm,
+            qk_layernorm=config.qk_layernorm,
+            multi_latent_attention=config.multi_latent_attention,
+            normalization=normalization,
+            qk_l2_norm=qk_l2_norm,
+            use_kitchen=config.use_kitchen,
+            use_kitchen_attention=config.use_kitchen_attention,
+            kitchen_attention_backend=config.kitchen_attention_backend,
+        )
 
-        if (
-            in_inference_mode
-            and (
-                (
-                    self.config.cuda_graph_impl == "local"
-                    and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
-                )
-                or self.config.flash_decode
-            )
-            and inference_context.is_static_batching()
-        ):
-            current_batch_size = input_ids.shape[0]
-            sequence_len_offset = torch.tensor(
-                [inference_context.sequence_len_offset] * current_batch_size,
-                dtype=torch.int32,
-                device=torch.cuda.current_device(),
-            )
+    # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.
+    # 0 stands for dense layers, 1 stands for expert layers.
+    # For integer N: Creates a pattern with one expert layer every N layers.
+    # For string pattern: Evaluates the str directly (e.g. "[1,0,1]" for alternating expert/dense).
+    if isinstance(config.moe_layer_freq, int):
+        moe_layer_pattern = [
+            1 if (i % config.moe_layer_freq == 0) else 0 for i in range(config.num_layers)
+        ]
+    elif isinstance(config.moe_layer_freq, list):
+        moe_layer_pattern = config.moe_layer_freq
+        assert len(moe_layer_pattern) == config.num_layers, (
+            f"Invalid length of moe_layer_pattern: {len(moe_layer_pattern)}, "
+            f"expected {config.num_layers}, "
+            f"current moe layer pattern: {config.moe_layer_freq}"
+        )
+    else:
+        raise ValueError(
+            f"Invalid moe_layer_freq: {type(config.moe_layer_freq)}, {config.moe_layer_freq}"
+        )
+
+    # Create the layer specs for the model.
+    layer_specs = []
+    for layer_number in range(config.num_layers):
+        if moe_layer_pattern[layer_number] == 1:
+            layer_specs.append(moe_layer_spec)
+        elif moe_layer_pattern[layer_number] == 0:
+            layer_specs.append(dense_layer_spec)
         else:
-            sequence_len_offset = None
+            raise ValueError(f"Invalid layer pattern: {moe_layer_pattern}")
 
-        if in_inference_mode:
-            # Clear the outputs for padding tokens when using dynamic batching with
-            # quantization scales to avoid corrupting amax calculations
-            if inference_context.is_dynamic_batching() and is_using_quantization_scales(
-                self.config
-            ):
-                decoder_input[inference_context.padding_slice] = 0.0
+    return layer_specs
 
-            # Wrap decoder_input to allow the decoder (TransformerBlock) to delete the
-            # reference held by this caller function, enabling early garbage collection for
-            # inference. Skip wrapping if decoder_input is logged after decoder completion.
-            if not has_config_logger_enabled(self.config):
-                decoder_input = WrappedTensor(decoder_input)
 
-        preproc_output = (
-            decoder_input,
-            rotary_pos_emb,
-            rotary_pos_cos,
-            rotary_pos_sin,
-            sequence_len_offset,
-            padding_mask,
-        )
-        if rotary_pos_cos_sin is not None:
-            # only in the case of flashinfer fused rope will we
-            # return this extra tensor
-            # this is for backwards compatibility with
-            # legacy unit tests, which break if you
-            # return a 7 tuple instead of 6.
-            preproc_output += (rotary_pos_cos_sin,)
+def get_gpt_decoder_block_spec(
+    config: TransformerConfig,
+    use_transformer_engine: bool,
+    normalization: Optional[str] = None,
+    qk_l2_norm: Optional[bool] = False,
+    vp_stage: Optional[int] = None,
+    pp_rank: Optional[int] = None,
+) -> TransformerBlockSubmodules:
+    """GPT block spec."""
+    layer_specs = get_gpt_decoder_layer_specs(
+        config, use_transformer_engine, normalization, qk_l2_norm
+    )
+    # Slice the layer specs to only include the layers that are built in this pipeline stage.
+    # Note: MCore layer_number starts at 1
+    num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
 
-        return preproc_output
-
-    def preprocess_for_fine_grained_offloading(self):
-        """Preprocess for fine-grained activation offloading."""
-        off_interface.init_chunk_handler(
-            vp_size=self.config.virtual_pipeline_model_parallel_size,
-            vp_stage=self.vp_stage,
-            min_offloaded_tensor_size=self.config.min_offloaded_tensor_size,
-        )
-        if self.disable_param_offloading:
-            for param in self.decoder.parameters():
-                off_interface.mark_not_offloadable(param)
-            if self.mtp_process:
-                for param in self.mtp.parameters():
-                    off_interface.mark_not_offloadable(param)
-            if self.post_process:
-                for param in self.output_layer.parameters():
-                    off_interface.mark_not_offloadable(param)
-            self.disable_param_offloading = False
-
-    def forward(
-        self,
-        input_ids: Tensor,
-        position_ids: Tensor,
-        attention_mask: Tensor,
-        decoder_input: Tensor = None,
-        labels: Tensor = None,
-        inference_context: BaseInferenceContext = None,
-        packed_seq_params: PackedSeqParams = None,
-        extra_block_kwargs: dict = None,
-        runtime_gather_output: Optional[bool] = None,
-        *,
-        inference_params: Optional[BaseInferenceContext] = None,
-        loss_mask: Optional[Tensor] = None,
-        padding_mask: Optional[Tensor] = None,
-        is_spec_decode: Optional[bool] = None,
-    ) -> Tensor:
-        """Forward function of the GPT Model This function passes the input tensors
-        through the embedding layer, and then the decoder and finally into the post
-        processing layer (optional).
-
-        It either returns the Loss values if labels are given  or the final hidden units
-
-        Args:
-            runtime_gather_output (bool): Gather output at runtime. Default None means
-                `parallel_output` arg in the constructor will be used.
-            padding_mask (Tensor, optional): Padding mask for MoE routing.
-                Shape [bsz, seq_length]. True = padding (exclude), False = valid (include).
-                Only used for MoE layers to exclude padding tokens from routing computations.
-            is_spec_decode (bool, optional): Explicitly override whether speculative
-                decoding is active.  When ``None`` (default) the flag is inferred from
-                ``inference_context.num_speculative_tokens``.
-        """
-        if self.config.fine_grained_activation_offloading:
-            self.preprocess_for_fine_grained_offloading()
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
-
-        preproc_output = self._preprocess(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            decoder_input=decoder_input,
-            inference_context=inference_context,
-            packed_seq_params=packed_seq_params,
-            padding_mask=padding_mask,
-        )
-
-        (
-            decoder_input,
-            rotary_pos_emb,
-            rotary_pos_cos,
-            rotary_pos_sin,
-            sequence_len_offset,
-            padding_mask,
-        ) = preproc_output[:6]
-
-        rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
-
-        # Run decoder.
-        hidden_states = self.decoder(
-            hidden_states=decoder_input,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            rotary_pos_cos_sin=rotary_pos_cos_sin,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
-            padding_mask=padding_mask,
-            **(extra_block_kwargs or {}),
-        )
-
-        return self._postprocess(
-            hidden_states=hidden_states,
-            input_ids=input_ids,
-            position_ids=position_ids,
-            labels=labels,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            mtp_in_postprocess=self.mtp_process,
-            loss_mask=loss_mask,
-            decoder_input=decoder_input,
-            attention_mask=attention_mask,
-            inference_params=inference_params,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
-            runtime_gather_output=runtime_gather_output,
-            extra_block_kwargs=extra_block_kwargs,
-            inference_context=inference_context,
-            is_spec_decode=is_spec_decode,
-        )
-
-    def _postprocess(
-        self,
-        hidden_states,
-        input_ids,
-        position_ids,
-        labels,
-        rotary_pos_emb,
-        rotary_pos_cos,
-        rotary_pos_sin,
-        mtp_in_postprocess=None,
-        loss_mask=None,
-        decoder_input=None,
-        attention_mask=None,
-        inference_params=None,
-        packed_seq_params=None,
-        sequence_len_offset=None,
-        runtime_gather_output=None,
-        extra_block_kwargs=None,
-        inference_context=None,
-        is_spec_decode=None,
-    ):
-        """Postprocesses decoder hidden states to generate logits or compute loss.
-
-        Applies Multi-Token Prediction if enabled, generates output logits through
-        the output layer, and computes language model loss when labels are provided.
-        """
-        in_inference_mode = inference_context is not None and not self.training
-        if in_inference_mode:
-            assert runtime_gather_output, "Inference must always gather TP logits"
-
-        # Check if speculative decoding is active. When it is, MTP must be
-        # computed *after* verification so that it is conditioned on verified
-        # tokens rather than stale speculative tokens from the previous step.
-        if is_spec_decode is None:
-            is_spec_decode = (
-                in_inference_mode
-                and inference_context.is_dynamic_batching()
-                and inference_context.num_speculative_tokens > 0
+    if config.pipeline_model_parallel_layout is not None:
+        layout = config.pipeline_model_parallel_layout
+        assert isinstance(layout, PipelineParallelLayerLayout)
+        local_layer_specs = [
+            layer_specs[layer_id]
+            for layer_id in layout.get_layer_id_list(
+                layer_type=LayerType.decoder, vp_stage=vp_stage, pp_rank=pp_rank
             )
+        ]
+    else:
+        offset = get_transformer_layer_offset(config, vp_stage=vp_stage, pp_rank=pp_rank)
+        local_layer_specs = layer_specs[offset : offset + num_layers_to_build]
 
-        # logits and loss
-        output_weight = None
-        if self.share_embeddings_and_output_weights:
-            output_weight = self.shared_embedding_or_output_weight()
-        if mtp_in_postprocess and not (in_inference_mode or is_spec_decode):
-            hidden_states = self.mtp(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                inference_params=None,  # MTP layers don't use KV cache
-                rotary_pos_emb=rotary_pos_emb,
-                rotary_pos_cos=rotary_pos_cos,
-                rotary_pos_sin=rotary_pos_sin,
-                packed_seq_params=packed_seq_params,
-                sequence_len_offset=sequence_len_offset,
-                embedding=self.embedding,
-                **(extra_block_kwargs or {}),
+    if use_transformer_engine:
+        layer_norm_impl = TENorm
+    elif config.transformer_impl == "inference_optimized":
+        layer_norm_impl = TENorm
+    else:
+        layer_norm_impl = LNImpl
+    # Block spec.
+    block_spec = TransformerBlockSubmodules(
+        layer_specs=local_layer_specs, layer_norm=layer_norm_impl
+    )
+
+    return block_spec
+
+
+def get_gpt_mtp_block_spec(
+    config: TransformerConfig,
+    spec: Union[TransformerBlockSubmodules, ModuleSpec],
+    use_transformer_engine: bool,
+    vp_stage: Optional[int] = None,
+    pp_rank: Optional[int] = None,
+) -> MultiTokenPredictionBlockSubmodules:
+    """GPT Multi-Token Prediction (MTP) block spec."""
+    if use_transformer_engine:
+        backend: BackendSpecProvider = (
+            KitchenSpecProvider(
+                fallback=TESpecProvider(),
+                use_kitchen_attention=config.use_kitchen_attention,
+                kitchen_attention_backend=config.kitchen_attention_backend,
             )
-
-        if not self.post_process:
-            return hidden_states
-
-        if self.config.mtp_num_layers:
-            assert self.config.mtp_num_layers > 0
-            if in_inference_mode or is_spec_decode:
-                # Cache decoder hidden states for serial MTP computation
-                # after speculative token verification.
-                self._decoder_hidden_states_cache = hidden_states
-            else:
-                # In training/eval, use the utility function for processing MTP loss/scaling.
-                hidden_states = process_mtp_loss(
-                    hidden_states=hidden_states,
-                    labels=labels,
-                    loss_mask=loss_mask,
-                    output_layer=self.output_layer,
-                    output_weight=output_weight,
-                    runtime_gather_output=runtime_gather_output,
-                    is_training=self.training,
-                    compute_language_model_loss=self.compute_language_model_loss,
-                    config=self.config,
-                    cp_group=self.pg_collection.cp,
-                    packed_seq_params=packed_seq_params,
-                    scale_logits_fn=self._scale_logits if self.config.use_mup else None,
-                )
-        sequence_parallel_override = False
-
-        if in_inference_mode and inference_context.config.materialize_only_last_token_logits:
-            if inference_context.is_static_batching():
-                hidden_states = hidden_states[-1:, :, :]
-            else:
-                if self.output_layer.sequence_parallel:
-                    # Perform the sequence parallel gather here instead of after the output layer
-                    # because we need to slice the last token logits from the full view of the
-                    # packed logits across all requests.
-                    hidden_states = gather_from_sequence_parallel_region(
-                        hidden_states, group=self.pg_collection.tp
-                    )
-                    self.output_layer.sequence_parallel = False
-                    sequence_parallel_override = True
-
-                # Reshape [S, B, H] (with B=1) to [1, S, H] for logit extraction,
-                # then back to [S’, B, H] for the output layer.
-                reshaped = hidden_states.squeeze(1).unsqueeze(0)
-                hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
-
-        logits, _ = self.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            if config.use_kitchen
+            else TESpecProvider()
         )
-
-        # Apply MuP output scaling to logits
-        logits = self._scale_logits(logits)
-
-        # Restore sequence parallel execution to the output layer if necessary.
-        if sequence_parallel_override:
-            assert (
-                in_inference_mode
-                and inference_context.is_dynamic_batching()
-                and inference_context.config.materialize_only_last_token_logits
+    else:
+        backend = (
+            KitchenSpecProvider(
+                fallback=LocalSpecProvider(),
+                use_kitchen_attention=config.use_kitchen_attention,
+                kitchen_attention_backend=config.kitchen_attention_backend,
             )
-            self.output_layer.sequence_parallel = True
-
-        if has_config_logger_enabled(self.config):
-            payload = OrderedDict(
-                {
-                    'input_ids': input_ids,
-                    'position_ids': position_ids,
-                    'attention_mask': attention_mask,
-                    'decoder_input': decoder_input,
-                    'logits': logits,
-                }
-            )
-            log_config_to_disk(self.config, payload, prefix='input_and_logits')
-
-        if labels is None:
-            # [s b h] => [b s h]
-            return logits.transpose(0, 1).contiguous()
-
-        loss = self.compute_language_model_loss(labels, logits)
-
-        return loss
-
-    def build_schedule_plan(
-        self,
-        input_ids: Tensor,
-        position_ids: Tensor,
-        attention_mask: Tensor,
-        decoder_input: Tensor = None,
-        labels: Tensor = None,
-        inference_context: BaseInferenceContext = None,
-        packed_seq_params: PackedSeqParams = None,
-        extra_block_kwargs: dict = None,
-        runtime_gather_output: Optional[bool] = None,
-        inference_params: Optional[BaseInferenceContext] = None,
-        loss_mask: Optional[Tensor] = None,
-        padding_mask: Optional[Tensor] = None,
-    ):
-        """Builds a computation schedule plan for the model.
-
-        This function creates a schedule plan for a model chunk, including
-        preprocessing, transformer layers, and postprocessing.
-        The schedule plan is used to optimize computation and memory usage
-        in distributed environments.
-
-        Args:
-            input_ids (Tensor): Input token IDs.
-            position_ids (Tensor): Position IDs.
-            attention_mask (Tensor): Attention mask.
-            decoder_input (Tensor, optional): Decoder input tensor. Defaults to None.
-            labels (Tensor, optional): Labels for loss computation. Defaults to None.
-            inference_context (BaseInferenceContext, optional):
-                Inference context. Defaults to None.
-            packed_seq_params (PackedSeqParams, optional):
-                Parameters for packed sequences. Defaults to None.
-            extra_block_kwargs (dict, optional):
-                Additional keyword arguments for blocks. Defaults to None.
-            runtime_gather_output (Optional[bool], optional):
-                Whether to gather output at runtime. Defaults to None.
-            inference_params (InferenceParams, optional):
-                Parameters for inference. Defaults to None.
-            loss_mask (Optional[Tensor], optional): Loss mask. Defaults to None.
-            padding_mask (Optional[Tensor], optional): Padding mask. Defaults to None.
-
-        Returns:
-            TransformerModelChunkSchedulePlan: The model chunk schedule plan.
-        """
-
-        if self.config.fine_grained_activation_offloading:
-            self.preprocess_for_fine_grained_offloading()
-
-        from ..common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
-
-        return TransformerModelChunkSchedulePlan(
-            self,
-            input_ids,
-            position_ids,
-            attention_mask,
-            decoder_input,
-            labels,
-            packed_seq_params,
-            extra_block_kwargs,
-            runtime_gather_output,
-            loss_mask,
-            padding_mask,
+            if config.use_kitchen
+            else LocalSpecProvider()
         )
+    return get_gpt_mtp_block_spec_for_backend(
+        config=config, spec=spec, backend=backend, vp_stage=vp_stage, pp_rank=pp_rank
+    )
 
-    def sharded_state_dict(
-        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[Dict] = None
-    ) -> ShardedStateDict:
-        """Sharded state dict implementation for GPTModel backward-compatibility.
 
-        Removing extra state.
-        Tie word embeddings and output layer in mtp process stage.
+def get_gpt_mtp_block_spec_for_backend(
+    config: TransformerConfig,
+    spec: Union[TransformerBlockSubmodules, ModuleSpec],
+    backend: BackendSpecProvider,
+    vp_stage: Optional[int] = None,
+    pp_rank: Optional[int] = None,
+) -> MultiTokenPredictionBlockSubmodules:
+    """GPT Multi-Token Prediction (MTP) block spec."""
+    num_layers_to_build = get_mtp_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
+    if num_layers_to_build == 0:
+        return None
 
-        Args:
-            prefix (str): Module name prefix.
-            sharded_offsets (tuple): PP related offsets, expected to be empty at this module level.
-            metadata (Optional[Dict]): metadata controlling sharded state dict creation.
+    if isinstance(spec, TransformerBlockSubmodules):
+        # get the spec for the last layer of decoder block
+        transformer_layer_spec = spec.layer_specs[-1]
+    elif isinstance(spec, ModuleSpec) and spec.module == TransformerLayer:
+        transformer_layer_spec = spec
+    else:
+        raise ValueError(f"Invalid spec: {spec}")
 
-        Returns:
-            ShardedStateDict: sharded state dict for the GPTModel
-        """
-        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
-        output_layer_extra_state_key = f'{prefix}output_layer._extra_state'
+    mtp_layer_spec = get_mtp_layer_spec_for_backend(
+        mtp_model_layer_spec=transformer_layer_spec, backend=backend
+    )
+    mtp_num_layers = config.mtp_num_layers if config.mtp_num_layers else 0
+    mtp_layer_specs = [mtp_layer_spec] * mtp_num_layers
 
-        # Old GPT checkpoints only stored the output layer weight key. So we remove the
-        # _extra_state key but check that it doesn't contain any data anyway
-        output_extra_state = sharded_state_dict.pop(output_layer_extra_state_key, None)
-        assert not (
-            output_extra_state and output_extra_state.data
-        ), f'Expected output layer extra state to be empty, got: {output_extra_state}'
+    offset = get_mtp_layer_offset(config, vp_stage=vp_stage)
+    # split the mtp layer specs to only include the layers that are built in this pipeline stage.
+    mtp_layer_specs = mtp_layer_specs[offset : offset + num_layers_to_build]
+    if len(mtp_layer_specs) > 0:
+        assert (
+            len(mtp_layer_specs) == config.mtp_num_layers
+        ), f"currently all of the mtp layers must stage in the same pipeline stage."
+        mtp_block_spec = MultiTokenPredictionBlockSubmodules(layer_specs=mtp_layer_specs)
+    else:
+        mtp_block_spec = None
 
-        return sharded_state_dict
+    return mtp_block_spec
