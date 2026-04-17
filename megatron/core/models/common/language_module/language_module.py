@@ -51,6 +51,7 @@ class LanguageModule(MegatronModule):
         self.pg_collection = pg_collection
         self.cp_group = pg_collection.cp
         self.tp_group = get_tensor_model_parallel_group_if_none(pg_collection.tp)
+        self.output_head_group = getattr(pg_collection, 'ohp', None)
         self.pp_group = pg_collection.pp
         assert hasattr(self.pg_collection, 'embd'), (
             "pg_collection must have a embd. In previous version, it used default "
@@ -138,6 +139,7 @@ class LanguageModule(MegatronModule):
         """
         # [b s] => [s b]
         labels = labels.transpose(0, 1).contiguous()
+        loss_parallel_group = self.output_head_group or self.pg_collection.tp
         if self.config.cross_entropy_loss_fusion:
             if self.config.cross_entropy_fusion_impl == 'te':
                 if te_parallel_cross_entropy is not None:
@@ -158,14 +160,16 @@ class LanguageModule(MegatronModule):
                         )
 
                     loss = te_parallel_cross_entropy(
-                        logits, labels, self.pg_collection.tp, is_cg_capturable
+                        logits, labels, loss_parallel_group, is_cg_capturable
                     )
                 else:
                     raise RuntimeError("Trying to use a TE block when it's not present.")
             elif self.config.cross_entropy_fusion_impl == 'native':
-                loss = fused_vocab_parallel_cross_entropy(logits, labels, self.pg_collection.tp)
+                loss = fused_vocab_parallel_cross_entropy(logits, labels, loss_parallel_group)
         else:
-            loss = tensor_parallel.vocab_parallel_cross_entropy(logits, labels)
+            loss = tensor_parallel.vocab_parallel_cross_entropy(
+                logits, labels, group=loss_parallel_group
+            )
 
         # [s b] => [b, s]
         loss = loss.transpose(0, 1).contiguous()

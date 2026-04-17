@@ -37,6 +37,7 @@ from megatron.core.transformer.multi_token_prediction import (
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.tensor_parallel.utils import VocabUtility
 from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
@@ -232,7 +233,6 @@ class GPTModel(LanguageModule):
 
         # Output
         if self.post_process:
-
             if self.config.defer_embedding_wgrad_compute:
                 # The embedding activation buffer preserves a reference to the input activations
                 # of the final embedding projection layer GEMM. It will hold the activations for
@@ -691,11 +691,34 @@ class GPTModel(LanguageModule):
             with_record_function=True,
             with_nvtx=True,
         ):
-            logits, _ = self.output_layer(
-                hidden_states,
-                weight=output_weight,
-                runtime_gather_output=runtime_gather_output,
+            output_head_group = self.output_head_group
+            use_output_head_parallel = (
+                output_head_group is not None and output_head_group.size() > 1
             )
+            if use_output_head_parallel:
+                gather_output = self.output_layer.gather_output
+                if runtime_gather_output is not None:
+                    gather_output = runtime_gather_output
+                vocab_start_index, vocab_end_index = VocabUtility.vocab_range_from_global_vocab_size(
+                    self.vocab_size,
+                    output_head_group.rank(),
+                    output_head_group.size(),
+                )
+                full_output_weight = (
+                    output_weight if output_weight is not None else self.output_layer.weight
+                )
+                local_weight = full_output_weight[vocab_start_index:vocab_end_index, :]
+                logits = torch.matmul(hidden_states, local_weight.t())
+                if gather_output:
+                    logits = tensor_parallel.gather_from_tensor_model_parallel_region(
+                        logits, group=output_head_group
+                    )
+            else:
+                logits, _ = self.output_layer(
+                    hidden_states,
+                    weight=output_weight,
+                    runtime_gather_output=runtime_gather_output,
+                )
 
         # Apply MuP output scaling to logits
         logits = self._scale_logits(logits)

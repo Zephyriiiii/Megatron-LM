@@ -121,21 +121,23 @@ class VocabParallelCrossEntropy:
 
 class _VocabParallelCrossEntropy(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, vocab_parallel_logits, target, label_smoothing=0.0):
+    def forward(ctx, vocab_parallel_logits, target, label_smoothing=0.0, group=None):
         """Vocab parallel cross entropy forward function."""
+        if group is None:
+            group = get_tensor_model_parallel_group()
 
         vocab_parallel_logits, logits_max = VocabParallelCrossEntropy.calculate_logits_max(
             vocab_parallel_logits
         )
         torch.distributed.all_reduce(
-            logits_max, op=torch.distributed.ReduceOp.MAX, group=get_tensor_model_parallel_group()
+            logits_max, op=torch.distributed.ReduceOp.MAX, group=group
         )
 
         # Get the partition's vocab indices
         get_vocab_range = VocabUtility.vocab_range_from_per_partition_vocab_size
         partition_vocab_size = vocab_parallel_logits.size()[-1]
-        rank = get_tensor_model_parallel_rank()
-        world_size = get_tensor_model_parallel_world_size()
+        rank = group.rank()
+        world_size = group.size()
         vocab_start_index, vocab_end_index = get_vocab_range(partition_vocab_size, rank, world_size)
 
         (target_mask, masked_target_1d, predicted_logits, sum_exp_logits, exp_logits) = (
@@ -148,13 +150,13 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         torch.distributed.all_reduce(
             predicted_logits,
             op=torch.distributed.ReduceOp.SUM,
-            group=get_tensor_model_parallel_group(),
+            group=group,
         )
 
         torch.distributed.all_reduce(
             sum_exp_logits,
             op=torch.distributed.ReduceOp.SUM,
-            group=get_tensor_model_parallel_group(),
+            group=group,
         )
 
         exp_logits, loss = VocabParallelCrossEntropy.calculate_cross_entropy_loss(
@@ -213,10 +215,10 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
                 grad_2d, arange_1d, masked_target_1d, softmax_update, grad_input, grad_output
             )
 
-        return grad_input, None, None
+        return grad_input, None, None, None
 
 
-def vocab_parallel_cross_entropy(vocab_parallel_logits, target, label_smoothing=0.0):
+def vocab_parallel_cross_entropy(vocab_parallel_logits, target, label_smoothing=0.0, group=None):
     """
     Performs cross entropy loss when logits are split across tensor parallel ranks
 
@@ -229,4 +231,6 @@ def vocab_parallel_cross_entropy(vocab_parallel_logits, target, label_smoothing=
         label_smoothing: smoothing factor, must be in range [0.0, 1.0)
                          default is no smoothing (=0.0)
     """
-    return _VocabParallelCrossEntropy.apply(vocab_parallel_logits, target, label_smoothing)
+    return _VocabParallelCrossEntropy.apply(
+        vocab_parallel_logits, target, label_smoothing, group
+    )
