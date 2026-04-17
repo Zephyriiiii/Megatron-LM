@@ -2271,18 +2271,20 @@ def get_profile_range():
         with_record_function: bool = False,
         with_nvtx: bool = False,
     ):
+        profiling_active = nvtx_profiling_enabled()
         record_ctx = (
             torch.autograd.profiler.record_function(msg)
-            if with_record_function
+            if with_record_function and profiling_active
             else nullcontext()
         )
         with record_ctx:
-            if with_nvtx:
+            nvtx_active = with_nvtx and profiling_active
+            if nvtx_active:
                 nvtx_range_push(msg=msg)
             try:
                 yield
             finally:
-                if with_nvtx:
+                if nvtx_active:
                     nvtx_range_pop(msg=msg)
 
     return profile_range

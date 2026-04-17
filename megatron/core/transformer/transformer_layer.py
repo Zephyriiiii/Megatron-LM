@@ -492,7 +492,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # use_nvfuser = TORCH_MAJOR > 1 or (TORCH_MAJOR == 1 and TORCH_MINOR >= 10)
         # self.bias_dropout_add_exec_handler = nullcontext if use_nvfuser else torch.enable_grad
         self.bias_dropout_add_exec_handler = torch.enable_grad
-        self._register_backward_profile_hooks()
+        if getattr(self.config, 'profile', False) or getattr(self.config, 'nvtx_ranges', False):
+            self._register_backward_profile_hooks()
 
     def _register_backward_profile_hooks(self):
         """Register high-level backward profiling hooks on the layer and its major submodules."""
@@ -699,24 +700,26 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Self attention.
         nvtx_range_push(suffix="self_attention")
-        with profile_range(
-            "layer/self_attention_core",
-            with_record_function=True,
-            with_nvtx=True,
-        ):
-            attention_output_with_bias = self.self_attention(
-                input_layernorm_output,
-                attention_mask=attention_mask,
-                inference_context=inference_context,
-                rotary_pos_emb=rotary_pos_emb,
-                rotary_pos_cos=rotary_pos_cos,
-                rotary_pos_sin=rotary_pos_sin,
-                rotary_pos_cos_sin=rotary_pos_cos_sin,
-                attention_bias=attention_bias,
-                packed_seq_params=packed_seq_params,
-                sequence_len_offset=sequence_len_offset,
-            )
-        nvtx_range_pop(suffix="self_attention")
+        try:
+            with profile_range(
+                "layer/self_attention_core",
+                with_record_function=True,
+                with_nvtx=True,
+            ):
+                attention_output_with_bias = self.self_attention(
+                    input_layernorm_output,
+                    attention_mask=attention_mask,
+                    inference_context=inference_context,
+                    rotary_pos_emb=rotary_pos_emb,
+                    rotary_pos_cos=rotary_pos_cos,
+                    rotary_pos_sin=rotary_pos_sin,
+                    rotary_pos_cos_sin=rotary_pos_cos_sin,
+                    attention_bias=attention_bias,
+                    packed_seq_params=packed_seq_params,
+                    sequence_len_offset=sequence_len_offset,
+                )
+        finally:
+            nvtx_range_pop(suffix="self_attention")
 
         if self.recompute_input_layernorm:
             # discard the output of the input layernorm and register the recompute
@@ -728,22 +731,24 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="self_attn_bda")
-        with profile_range(
-            "layer/self_attn_bda",
-            with_record_function=True,
-            with_nvtx=True,
-        ):
-            if using_fused_tp_inference_kernel:
-                # In inference optimized transformer layer, there is no bias and dropout
-                # The remaining residual add is already handled inside the
-                # self attention module.
-                hidden_states = attention_output_with_bias[0]
-            else:
-                with self.bias_dropout_add_exec_handler():
-                    hidden_states = self.self_attn_bda(
-                        self.training, self.config.bias_dropout_fusion
-                    )(attention_output_with_bias, residual, self.hidden_dropout)
-        nvtx_range_pop(suffix="self_attn_bda")
+        try:
+            with profile_range(
+                "layer/self_attn_bda",
+                with_record_function=True,
+                with_nvtx=True,
+            ):
+                if using_fused_tp_inference_kernel:
+                    # In inference optimized transformer layer, there is no bias and dropout
+                    # The remaining residual add is already handled inside the
+                    # self attention module.
+                    hidden_states = attention_output_with_bias[0]
+                else:
+                    with self.bias_dropout_add_exec_handler():
+                        hidden_states = self.self_attn_bda(
+                            self.training, self.config.bias_dropout_fusion
+                        )(attention_output_with_bias, residual, self.hidden_dropout)
+        finally:
+            nvtx_range_pop(suffix="self_attn_bda")
 
         # Delay the offload of the attention norm until after the self_attn_bda has been computed
         # because the residual is needed in the self_attn_bda.
@@ -894,81 +899,82 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             residual = residual.float()
 
         nvtx_range_push(suffix="mlp")
-        # Potentially chunk the MLP computation during prefill to minimize the peak activation size
-        should_chunk_mlp_for_prefill = (
-            self.config.mlp_chunks_for_prefill > 1
-            and inference_context is not None
-            and not inference_context.is_decode_only()
-            and not isinstance(self.mlp, IdentityOp)
-            and not self.config.transformer_impl == "inference_optimized"
-        )
+        try:
+            # Potentially chunk the MLP computation during prefill to minimize the peak activation size
+            should_chunk_mlp_for_prefill = (
+                self.config.mlp_chunks_for_prefill > 1
+                and inference_context is not None
+                and not inference_context.is_decode_only()
+                and not isinstance(self.mlp, IdentityOp)
+                and not self.config.transformer_impl == "inference_optimized"
+            )
 
-        using_fused_tp_inference_kernel = (not self.training) and (
-            self.config.inference_fuse_tp_communication
-        )
+            using_fused_tp_inference_kernel = (not self.training) and (
+                self.config.inference_fuse_tp_communication
+            )
 
-        if self.recompute_mlp:
-            if self.config.fp8 or self.config.fp4:
-                # import here to avoid circular import
-                from megatron.core.extensions.transformer_engine import te_checkpoint
+            if self.recompute_mlp:
+                if self.config.fp8 or self.config.fp4:
+                    # import here to avoid circular import
+                    from megatron.core.extensions.transformer_engine import te_checkpoint
 
+                    with profile_range(
+                        "layer/mlp_core",
+                        with_record_function=True,
+                        with_nvtx=True,
+                    ):
+                        mlp_output_with_bias = te_checkpoint(
+                            self.mlp,
+                            False,
+                            tensor_parallel.random.get_cuda_rng_tracker,
+                            self.pg_collection.tp,
+                            pre_mlp_layernorm_output,
+                            padding_mask=padding_mask,
+                        )
+                else:
+                    with profile_range(
+                        "layer/mlp_core",
+                        with_record_function=True,
+                        with_nvtx=True,
+                    ):
+                        mlp_output_with_bias = tensor_parallel.checkpoint(
+                            functools.partial(self.mlp, padding_mask=padding_mask),
+                            False,
+                            pre_mlp_layernorm_output,
+                        )
+            elif should_chunk_mlp_for_prefill:
+                # Chunk input along sequence dimension
+                num_chunks = min(self.config.mlp_chunks_for_prefill, pre_mlp_layernorm_output.shape[0])
+                chunks = pre_mlp_layernorm_output.chunk(num_chunks, dim=0)
+
+                # Compute outputs for each chunk
                 with profile_range(
                     "layer/mlp_core",
                     with_record_function=True,
                     with_nvtx=True,
                 ):
-                    mlp_output_with_bias = te_checkpoint(
-                        self.mlp,
-                        False,
-                        tensor_parallel.random.get_cuda_rng_tracker,
-                        self.pg_collection.tp,
-                        pre_mlp_layernorm_output,
-                        padding_mask=padding_mask,
-                    )
+                    outputs = [self.mlp(chunk) for chunk in chunks]
+
+                # Aggregate chunk outputs
+                mlp_output = torch.cat([out for out, _ in outputs], dim=0)
+                bias_chunks = [bias for _, bias in outputs if bias is not None]
+                bias_output = torch.stack(bias_chunks, dim=0).sum(dim=0) if bias_chunks else None
+                mlp_output_with_bias = (mlp_output, bias_output)
             else:
+                if using_fused_tp_inference_kernel:
+                    # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
+                    # operation in MLP's fc2.
+                    self._set_fc2_residual(residual)
                 with profile_range(
                     "layer/mlp_core",
                     with_record_function=True,
                     with_nvtx=True,
                 ):
-                    mlp_output_with_bias = tensor_parallel.checkpoint(
-                        functools.partial(self.mlp, padding_mask=padding_mask),
-                        False,
-                        pre_mlp_layernorm_output,
+                    mlp_output_with_bias = self.mlp(
+                        pre_mlp_layernorm_output, padding_mask=padding_mask
                     )
-        elif should_chunk_mlp_for_prefill:
-            # Chunk input along sequence dimension
-            num_chunks = min(self.config.mlp_chunks_for_prefill, pre_mlp_layernorm_output.shape[0])
-            chunks = pre_mlp_layernorm_output.chunk(num_chunks, dim=0)
-
-            # Compute outputs for each chunk
-            with profile_range(
-                "layer/mlp_core",
-                with_record_function=True,
-                with_nvtx=True,
-            ):
-                outputs = [self.mlp(chunk) for chunk in chunks]
-
-            # Aggregate chunk outputs
-            mlp_output = torch.cat([out for out, _ in outputs], dim=0)
-            bias_chunks = [bias for _, bias in outputs if bias is not None]
-            bias_output = torch.stack(bias_chunks, dim=0).sum(dim=0) if bias_chunks else None
-            mlp_output_with_bias = (mlp_output, bias_output)
-        else:
-            if using_fused_tp_inference_kernel:
-                # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
-                # operation in MLP's fc2.
-                self._set_fc2_residual(residual)
-            with profile_range(
-                "layer/mlp_core",
-                with_record_function=True,
-                with_nvtx=True,
-            ):
-                mlp_output_with_bias = self.mlp(
-                    pre_mlp_layernorm_output, padding_mask=padding_mask
-                )
-
-        nvtx_range_pop(suffix="mlp")
+        finally:
+            nvtx_range_pop(suffix="mlp")
 
         if (
             self.is_moe_layer
@@ -1019,22 +1025,24 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="mlp_bda")
-        with profile_range(
-            "layer/mlp_bda",
-            with_record_function=True,
-            with_nvtx=True,
-        ):
-            if using_fused_tp_inference_kernel:
-                # In inference optimized transformer layer, there is no bias and dropout
-                # The remaining residual add is already handled inside the
-                # MLP module.
-                hidden_states = mlp_output_with_bias[0]
-            else:
-                with self.bias_dropout_add_exec_handler():
-                    hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
-                        mlp_output_with_bias, residual, self.hidden_dropout
-                    )
-        nvtx_range_pop(suffix="mlp_bda")
+        try:
+            with profile_range(
+                "layer/mlp_bda",
+                with_record_function=True,
+                with_nvtx=True,
+            ):
+                if using_fused_tp_inference_kernel:
+                    # In inference optimized transformer layer, there is no bias and dropout
+                    # The remaining residual add is already handled inside the
+                    # MLP module.
+                    hidden_states = mlp_output_with_bias[0]
+                else:
+                    with self.bias_dropout_add_exec_handler():
+                        hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
+                            mlp_output_with_bias, residual, self.hidden_dropout
+                        )
+        finally:
+            nvtx_range_pop(suffix="mlp_bda")
         # Delay the offload of the mlp norm until after the mlp_bda has been computed
         # because the residual is needed in the mlp_bda.
         if self.offload_mlp_norm:
