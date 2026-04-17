@@ -122,7 +122,7 @@ MODEL_ARGS=(
 TOKENIZER_AND_DATA_ARGS=(
   --tokenizer-type HuggingFaceTokenizer
   --tokenizer-model "${TOKENIZER_MODEL}"
-  --make-vocab-size-divisible-by 151643
+  --make-vocab-size-divisible-by 128
   --mock-data
   --no-create-attention-mask-in-dataloader
 )
