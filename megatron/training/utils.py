@@ -39,6 +39,7 @@ from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 from megatron.core.utils import (
     get_batch_on_this_cp_rank,
     get_data_parallel_group_if_dtensor,
+    nvtx_profiling_enabled,
     to_local_if_dtensor,
     unwrap_model,
 )
@@ -774,11 +775,14 @@ def get_nvtx_range():
             if time:
                 timers = get_timers()
                 timers(msg, log_level=log_level).start()
+            nvtx_active = nvtx_profiling_enabled()
             try:
-                nvtx.range_push(msg)
+                if nvtx_active:
+                    nvtx.range_push(msg)
                 yield
             finally:
-                nvtx.range_pop()
+                if nvtx_active:
+                    nvtx.range_pop()
                 if time:
                     timers(msg, log_level=log_level).stop()
 

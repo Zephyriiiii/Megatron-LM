@@ -37,6 +37,7 @@ from megatron.core.utils import (
     is_torch_min_version,
 )
 from megatron.training.argument_utils import ArgumentGroupFactory
+from megatron.training.global_vars import set_global_variables
 from megatron.training.utils import (
     get_device_arch_version,
     print_rank_0,
@@ -83,6 +84,38 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_sft_args(parser)
 
     return parser
+
+
+def parse_and_validate_args(extra_args_provider=None, ignore_unknown_args=False, args_defaults=None):
+    """Backwards-compatible entry point used by training/inference launchers."""
+    args_defaults = {} if args_defaults is None else args_defaults
+    args = parse_args(extra_args_provider, ignore_unknown_args)
+
+    if args.use_checkpoint_args or args_defaults.get("use_checkpoint_args", False):
+        from megatron.training.checkpointing import load_args_from_checkpoint
+
+        assert args.load is not None or args.pretrained_checkpoint is not None, (
+            "--use-checkpoint-args requires --load or --pretrained-checkpoint argument"
+        )
+        assert args.non_persistent_ckpt_type != "local", (
+            "--use-checkpoint-args is not supported with "
+            "--non_persistent_ckpt_type=local. Two-stage checkpoint loading is not "
+            "implemented, and all arguments must be defined before initializing "
+            "LocalCheckpointManager."
+        )
+        load_args_from_checkpoint(args, load_arg='pretrained_checkpoint')
+        load_args_from_checkpoint(args)
+
+    if args.yaml_cfg is not None:
+        from megatron.training.yaml_arguments import validate_yaml
+
+        args = validate_yaml(args, args_defaults)
+    else:
+        validate_args(args, args_defaults)
+
+    set_global_variables(args)
+    return args
+
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     """Parse all arguments."""

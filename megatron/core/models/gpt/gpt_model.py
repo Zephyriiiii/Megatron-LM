@@ -2,6 +2,7 @@
 import warnings
 from typing import Optional, Union
 
+from .gpt_model_impl import GPTModel
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import (

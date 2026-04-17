@@ -2138,6 +2138,11 @@ def configure_nvtx_profiling(enabled: bool) -> None:
     _nvtx_enabled = enabled
 
 
+def nvtx_profiling_enabled() -> bool:
+    """Return whether Megatron NVTX helpers should currently emit ranges."""
+    return _nvtx_enabled
+
+
 def _nvtx_range_get_func_path():
     """Get the path of a function. Assumes being called from nvtx_range_push/pop.
 

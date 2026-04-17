@@ -37,8 +37,20 @@ def build_pretraining_data_loader(dataset, consumed_samples):
 
     # Use eval-specific batch sizes for validation/test splits
     is_eval = split in (Split.valid, Split.test)
-    micro_batch_size = getattr(args, 'eval_micro_batch_size', args.micro_batch_size) if is_eval else args.micro_batch_size
-    global_batch_size = getattr(args, 'eval_global_batch_size', args.global_batch_size) if is_eval else args.global_batch_size
+    if is_eval:
+        micro_batch_size = (
+            args.eval_micro_batch_size
+            if getattr(args, 'eval_micro_batch_size', None) is not None
+            else args.micro_batch_size
+        )
+        global_batch_size = (
+            args.eval_global_batch_size
+            if getattr(args, 'eval_global_batch_size', None) is not None
+            else args.global_batch_size
+        )
+    else:
+        micro_batch_size = args.micro_batch_size
+        global_batch_size = args.global_batch_size
 
     if split == Split.valid and args.full_validation:
         batch_sampler = MegatronPretrainingSampler(
