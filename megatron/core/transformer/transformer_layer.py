@@ -497,12 +497,23 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     def _register_backward_profile_hooks(self):
         """Register high-level backward profiling hooks on the layer and its major submodules."""
 
+        def nested_attr(module, path):
+            current = module
+            for part in path.split('.'):
+                current = getattr(current, part, None)
+                if current is None:
+                    return None
+            return current
+
         hook_specs = (
             (self.self_attention, "layer/self_attention/backward"),
+            (nested_attr(self.self_attention, "core_attention"), "layer/core_attention/backward"),
             (self.input_layernorm, "layer/input_layernorm/backward"),
             (self.self_attn_bda, "layer/self_attn_bda/backward"),
             (self.pre_mlp_layernorm, "layer/pre_mlp_layernorm/backward"),
             (self.mlp, "layer/mlp/backward"),
+            (nested_attr(self.mlp, "linear_fc1"), "layer/mlp_linear_fc1/backward"),
+            (nested_attr(self.mlp, "linear_fc2"), "layer/mlp_linear_fc2/backward"),
             (self.mlp_bda, "layer/mlp_bda/backward"),
         )
         self._profile_backward_hook_handles = []
@@ -515,6 +526,40 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
             self._profile_backward_hook_handles.append(
                 module.register_full_backward_hook(backward_post_hook)
+            )
+
+        # Span the full MLP core backward path with a dedicated range:
+        # linear_fc2 backward -> activation backward -> linear_fc1 backward.
+        mlp_fc1 = nested_attr(self.mlp, "linear_fc1")
+        mlp_fc2 = nested_attr(self.mlp, "linear_fc2")
+        if (
+            hasattr(mlp_fc2, "register_full_backward_pre_hook")
+            and hasattr(mlp_fc1, "register_full_backward_hook")
+        ):
+            mlp_core_backward_ctx_stack = []
+
+            def mlp_core_backward_pre_hook(module, grad_output):
+                ctx = torch.autograd.profiler.record_function("layer/mlp_core/backward")
+                ctx.__enter__()
+                range_id = None
+                if torch.cuda.is_available():
+                    range_id = torch.cuda.nvtx.range_start("layer/mlp_core/backward")
+                mlp_core_backward_ctx_stack.append((ctx, range_id))
+                return None
+
+            def mlp_core_backward_post_hook(module, grad_input, grad_output):
+                if mlp_core_backward_ctx_stack:
+                    ctx, range_id = mlp_core_backward_ctx_stack.pop()
+                    if range_id is not None:
+                        torch.cuda.nvtx.range_end(range_id)
+                    ctx.__exit__(None, None, None)
+                return None
+
+            self._profile_backward_hook_handles.append(
+                mlp_fc2.register_full_backward_pre_hook(mlp_core_backward_pre_hook)
+            )
+            self._profile_backward_hook_handles.append(
+                mlp_fc1.register_full_backward_hook(mlp_core_backward_post_hook)
             )
 
     def create_mcore_cudagraph_manager(self, config):
