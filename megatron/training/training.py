@@ -2517,9 +2517,19 @@ def post_training_step_callbacks(
             if prof.execution_trace_observer is not None:
                 prof.execution_trace_observer.unregister_callback()
         else:
+            # When profiling a torchrun job under a single Nsight Systems session,
+            # one rank can otherwise stop capture while other ranks still have
+            # NVTX ranges open, or resume training with NVTX still enabled
+            # after capture has ended, which produces truncated end timestamps.
+            torch.cuda.synchronize()
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
             torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStop())
+            configure_nvtx_profiling(False)
             if nsys_nvtx_context is not None:
                 nsys_nvtx_context.__exit__(None, None, None)
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
 
     # Manual garbage collection.
     if args.manual_gc:
