@@ -45,6 +45,12 @@ class ModelParallelConfig:
     context_parallel_size: int = 1
     """Splits network input along sequence dimension across GPU ranks."""
 
+    output_head_parallel_size: int = 1
+    """Splits only the output-layer vocab projection across GPU ranks.
+       This is independent from tensor model parallelism and is intended to keep
+       transformer-block execution free of TP communication.
+    """
+
     hierarchical_context_parallel_sizes: Optional[list[int]] = None
     """Degrees of the hierarchical context parallelism. Users should provide a list to specify 
        the sizes for different levels. Taking the a2a+p2p cp comm type as example, it contains

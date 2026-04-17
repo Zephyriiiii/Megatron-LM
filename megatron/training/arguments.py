@@ -360,6 +360,32 @@ def validate_args(args, defaults={}):
 
     total_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
     args.data_parallel_size = args.world_size // total_model_size
+    args.effective_data_parallel_size = args.data_parallel_size
+    if args.output_head_parallel_size > 1:
+        assert args.use_megatron_fsdp, (
+            "--output-head-parallel-size currently requires --use-megatron-fsdp"
+        )
+        assert args.tensor_model_parallel_size == 1, (
+            "--output-head-parallel-size requires --tensor-model-parallel-size 1"
+        )
+        assert args.pipeline_model_parallel_size == 1, (
+            "--output-head-parallel-size requires --pipeline-model-parallel-size 1"
+        )
+        assert args.context_parallel_size == 1, (
+            "--output-head-parallel-size requires --context-parallel-size 1"
+        )
+        assert args.expert_model_parallel_size == 1, (
+            "--output-head-parallel-size does not support expert parallelism"
+        )
+        assert args.world_size % args.output_head_parallel_size == 0, (
+            "world size must be divisible by --output-head-parallel-size"
+        )
+        assert args.data_parallel_size % args.output_head_parallel_size == 0, (
+            "data parallel size must be divisible by --output-head-parallel-size"
+        )
+        args.effective_data_parallel_size = (
+            args.data_parallel_size // args.output_head_parallel_size
+        )
 
     if args.perform_rl_step:
         # ----------------------------------------------------------------
@@ -489,12 +515,16 @@ def validate_args(args, defaults={}):
                 "micro_batch_size must be 1 when using sequence packing. To increase compute per micro batch increase the sequence length."
 
     print_rank_0('using world size: {}, data-parallel size: {}, '
+                 'effective data-parallel size: {}, '
                  'context-parallel size: {}, '
+                 'output-head-parallel size: {}, '
                  'hierarchical context-parallel sizes: {}, '
                  'tensor-model-parallel size: {}, '
                  'pipeline-model-parallel size: {}'.format(
                      args.world_size, args.data_parallel_size,
+                     args.effective_data_parallel_size,
                      args.context_parallel_size,
+                     args.output_head_parallel_size,
                      args.hierarchical_context_parallel_sizes,
                      args.tensor_model_parallel_size,
                      args.pipeline_model_parallel_size))
@@ -596,7 +626,7 @@ def validate_args(args, defaults={}):
     assert args.micro_batch_size is not None
     assert args.micro_batch_size > 0
     if args.global_batch_size is None:
-        args.global_batch_size = args.micro_batch_size * args.data_parallel_size
+        args.global_batch_size = args.micro_batch_size * args.effective_data_parallel_size
         print_rank_0('setting global batch size to {}'.format(args.global_batch_size))
     assert args.global_batch_size > 0
 

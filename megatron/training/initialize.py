@@ -368,6 +368,10 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 high_priority_stream_groups=args.high_priority_stream_groups,
                 sharp_enabled_group=args.sharp_enabled_group,
             )
+            mpu.initialize_output_head_parallel(
+                args.output_head_parallel_size,
+                timeout=timedelta(minutes=args.distributed_timeout_minutes),
+            )
             print_rank_0(
                 f"> initialized tensor model parallel with size "
                 f"{mpu.get_tensor_model_parallel_world_size()}"
@@ -400,7 +404,7 @@ def _set_random_seed(
         seed = seed_ + (100 * mpu.get_pipeline_model_parallel_rank())
         # Ensure different data parallel ranks get different seeds
         if data_parallel_random_init:
-            seed = seed + (10 * mpu.get_data_parallel_rank())
+            seed = seed + (10 * mpu.get_effective_data_parallel_rank())
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)

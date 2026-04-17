@@ -126,7 +126,7 @@ def set_global_variables(args, build_tokenizer=True):
         args.rampup_batch_size,
         args.global_batch_size,
         args.micro_batch_size,
-        args.data_parallel_size,
+        getattr(args, "effective_data_parallel_size", args.data_parallel_size),
         args.decrease_batch_size_if_needed,
     )
     if build_tokenizer:

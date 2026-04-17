@@ -70,6 +70,9 @@ class ProcessGroupCollection:
     # _TENSOR_MODEL_PARALLEL_GROUP
     tp: torch.distributed.ProcessGroup = field(init=False)
 
+    # Output-head parallel process group (local vocab-parallel head only)
+    ohp: torch.distributed.ProcessGroup = field(init=False)
+
     # _PIPELINE_MODEL_PARALLEL_GROUP
     pp: torch.distributed.ProcessGroup = field(init=False)
 
@@ -190,6 +193,7 @@ class ProcessGroupCollection:
         # Mapping of attribute names to their initialization functions
         pg_to_func = {
             'tp': partial(parallel_state.get_tensor_model_parallel_group, check_initialized=False),
+            'ohp': partial(parallel_state.get_output_head_parallel_group, check_initialized=False),
             'pp': partial(
                 parallel_state.get_pipeline_model_parallel_group, check_initialized=False
             ),

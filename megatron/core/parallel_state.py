@@ -27,6 +27,8 @@ except ImportError:
 
 # Intra-layer model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
+# Output-head parallel group that the current rank belongs to.
+_OUTPUT_HEAD_PARALLEL_GROUP = None
 # Inter-layer model parallel group that the current rank belongs to.
 _PIPELINE_MODEL_PARALLEL_GROUP = None
 # Model parallel group (both intra- and pipeline) that the current rank belongs to.
@@ -99,6 +101,7 @@ _DATA_PARALLEL_GLOBAL_RANKS = None
 # A list of global ranks for each tensor model parallel group to ease calculation of
 # the first local rank in the tensor model parallel group
 _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = None
+_OUTPUT_HEAD_PARALLEL_GLOBAL_RANKS = None
 
 # A list of global ranks for each expert model parallel group to ease calculation of
 # the first local rank in the expert model parallel group
@@ -1423,6 +1426,64 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
     return dp_cp_ag_group, expt_dp_ag_group
 
 
+def initialize_output_head_parallel(
+    output_head_parallel_size: int,
+    timeout: Optional[timedelta] = None,
+    nccl_comm_cfgs: Optional[dict] = None,
+):
+    """Create output-head parallel groups.
+
+    V1 supports only the pure-FSDP / no-TP / no-PP / no-CP case. Groups are formed from
+    contiguous global ranks and are used only by the output projection + CE path.
+    """
+    global _OUTPUT_HEAD_PARALLEL_GROUP
+    global _OUTPUT_HEAD_PARALLEL_GLOBAL_RANKS
+    global _MPU_OUTPUT_HEAD_PARALLEL_WORLD_SIZE
+    global _MPU_OUTPUT_HEAD_PARALLEL_RANK
+
+    assert is_initialized(), "Call initialize_model_parallel() first."
+    assert output_head_parallel_size >= 1
+
+    if output_head_parallel_size == 1:
+        _OUTPUT_HEAD_PARALLEL_GROUP = get_tensor_model_parallel_group(check_initialized=False)
+        _OUTPUT_HEAD_PARALLEL_GLOBAL_RANKS = [torch.distributed.get_rank()]
+        _MPU_OUTPUT_HEAD_PARALLEL_WORLD_SIZE = 1
+        _MPU_OUTPUT_HEAD_PARALLEL_RANK = 0
+        return
+
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+    assert (
+        world_size % output_head_parallel_size == 0
+    ), "world size must be divisible by output_head_parallel_size"
+    assert (
+        get_tensor_model_parallel_world_size() == 1
+    ), "output-head parallel requires tensor_model_parallel_size == 1"
+    assert (
+        get_pipeline_model_parallel_world_size() == 1
+    ), "output-head parallel requires pipeline_model_parallel_size == 1"
+    assert (
+        get_context_parallel_world_size() == 1
+    ), "output-head parallel requires context_parallel_size == 1"
+    assert (
+        get_expert_model_parallel_world_size() == 1
+    ), "output-head parallel requires expert_model_parallel_size == 1"
+
+    for start in range(0, world_size, output_head_parallel_size):
+        ranks = list(range(start, start + output_head_parallel_size))
+        group = create_group(
+            ranks,
+            timeout=timeout,
+            pg_options=get_nccl_options("output_head_parallel", nccl_comm_cfgs or {}),
+            group_desc="OUTPUT_HEAD_PARALLEL_GROUP",
+        )
+        if rank in ranks:
+            _OUTPUT_HEAD_PARALLEL_GROUP = group
+            _OUTPUT_HEAD_PARALLEL_GLOBAL_RANKS = ranks
+            _MPU_OUTPUT_HEAD_PARALLEL_WORLD_SIZE = output_head_parallel_size
+            _MPU_OUTPUT_HEAD_PARALLEL_RANK = ranks.index(rank)
+
+
 def is_initialized():
     """Useful for code segments that may be accessed with or without mpu initialization"""
     return _DATA_PARALLEL_GROUP is not None
@@ -1453,6 +1514,15 @@ def get_tensor_model_parallel_group(check_initialized=True):
             _TENSOR_MODEL_PARALLEL_GROUP is not None
         ), "tensor model parallel group is not initialized"
     return _TENSOR_MODEL_PARALLEL_GROUP
+
+
+def get_output_head_parallel_group(check_initialized=True):
+    """Get the output-head-parallel group the caller rank belongs to."""
+    if check_initialized:
+        assert (
+            _OUTPUT_HEAD_PARALLEL_GROUP is not None
+        ), "output head parallel group is not initialized"
+    return _OUTPUT_HEAD_PARALLEL_GROUP
 
 
 def get_pipeline_model_parallel_group(check_initialized=True):
@@ -1606,6 +1676,12 @@ def set_tensor_model_parallel_world_size(world_size):
     _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = world_size
 
 
+def set_output_head_parallel_world_size(world_size):
+    """Set output-head-parallel world size."""
+    global _MPU_OUTPUT_HEAD_PARALLEL_WORLD_SIZE
+    _MPU_OUTPUT_HEAD_PARALLEL_WORLD_SIZE = world_size
+
+
 def set_pipeline_model_parallel_world_size(world_size):
     """Set the pipeline-model-parallel size"""
     global _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
@@ -1626,6 +1702,16 @@ def get_tensor_model_parallel_world_size():
     return get_tensor_model_parallel_group().size()
 
 
+def get_output_head_parallel_world_size():
+    """Return world size for the output-head-parallel group."""
+    global _MPU_OUTPUT_HEAD_PARALLEL_WORLD_SIZE
+    if _MPU_OUTPUT_HEAD_PARALLEL_WORLD_SIZE is not None:
+        return _MPU_OUTPUT_HEAD_PARALLEL_WORLD_SIZE
+    if _OUTPUT_HEAD_PARALLEL_GROUP is None:
+        return 1
+    return _OUTPUT_HEAD_PARALLEL_GROUP.size()
+
+
 def get_pipeline_model_parallel_world_size():
     """Return world size for the pipeline-model-parallel group."""
     global _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
@@ -1640,6 +1726,12 @@ def set_tensor_model_parallel_rank(rank):
     _MPU_TENSOR_MODEL_PARALLEL_RANK = rank
 
 
+def set_output_head_parallel_rank(rank):
+    """Set output-head-parallel rank."""
+    global _MPU_OUTPUT_HEAD_PARALLEL_RANK
+    _MPU_OUTPUT_HEAD_PARALLEL_RANK = rank
+
+
 def set_pipeline_model_parallel_rank(rank):
     """Set pipeline-model-parallel rank."""
     global _MPU_PIPELINE_MODEL_PARALLEL_RANK
@@ -1652,6 +1744,16 @@ def get_tensor_model_parallel_rank():
     if _MPU_TENSOR_MODEL_PARALLEL_RANK is not None:
         return _MPU_TENSOR_MODEL_PARALLEL_RANK
     return get_tensor_model_parallel_group().rank()
+
+
+def get_output_head_parallel_rank():
+    """Return caller's rank for the output-head-parallel group."""
+    global _MPU_OUTPUT_HEAD_PARALLEL_RANK
+    if _MPU_OUTPUT_HEAD_PARALLEL_RANK is not None:
+        return _MPU_OUTPUT_HEAD_PARALLEL_RANK
+    if _OUTPUT_HEAD_PARALLEL_GROUP is None:
+        return 0
+    return _OUTPUT_HEAD_PARALLEL_GROUP.rank()
 
 
 def get_pipeline_model_parallel_rank():
@@ -1801,6 +1903,18 @@ def get_data_parallel_world_size(with_context_parallel=False, partial_data_paral
         return 0
 
 
+def get_effective_data_parallel_world_size(with_context_parallel=False):
+    """Return data-parallel world size after collapsing output-head replicas."""
+    dp_world_size = get_data_parallel_world_size(with_context_parallel=with_context_parallel)
+    ohp_world_size = get_output_head_parallel_world_size()
+    if ohp_world_size <= 1:
+        return dp_world_size
+    assert (
+        dp_world_size % ohp_world_size == 0
+    ), "data parallel size must be divisible by output_head_parallel_size"
+    return dp_world_size // ohp_world_size
+
+
 def set_data_parallel_rank(rank):
     """Return world size for the data parallel group."""
     global _MPU_DATA_PARALLEL_RANK
@@ -1818,6 +1932,15 @@ def get_data_parallel_rank(with_context_parallel=False, partial_data_parallel=Fa
         ).rank()
     else:
         return 0
+
+
+def get_effective_data_parallel_rank(with_context_parallel=False):
+    """Return data-parallel rank after collapsing output-head replicas."""
+    dp_rank = get_data_parallel_rank(with_context_parallel=with_context_parallel)
+    ohp_world_size = get_output_head_parallel_world_size()
+    if ohp_world_size <= 1:
+        return dp_rank
+    return dp_rank // ohp_world_size
 
 
 def get_context_parallel_world_size():
@@ -2098,6 +2221,9 @@ def destroy_model_parallel():
     global _TENSOR_MODEL_PARALLEL_GROUP
     _TENSOR_MODEL_PARALLEL_GROUP = None
 
+    global _OUTPUT_HEAD_PARALLEL_GROUP
+    _OUTPUT_HEAD_PARALLEL_GROUP = None
+
     global _PIPELINE_MODEL_PARALLEL_GROUP
     _PIPELINE_MODEL_PARALLEL_GROUP = None
 
@@ -2128,6 +2254,9 @@ def destroy_model_parallel():
     global _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
     _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = None
 
+    global _OUTPUT_HEAD_PARALLEL_GLOBAL_RANKS
+    _OUTPUT_HEAD_PARALLEL_GLOBAL_RANKS = None
+
     global _TENSOR_AND_CONTEXT_PARALLEL_GROUP
     _TENSOR_AND_CONTEXT_PARALLEL_GROUP = None
 
@@ -2140,8 +2269,14 @@ def destroy_model_parallel():
     global _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
     _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = None
 
+    global _MPU_OUTPUT_HEAD_PARALLEL_WORLD_SIZE
+    _MPU_OUTPUT_HEAD_PARALLEL_WORLD_SIZE = None
+
     global _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
     _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = None
+
+    global _MPU_OUTPUT_HEAD_PARALLEL_RANK
+    _MPU_OUTPUT_HEAD_PARALLEL_RANK = None
 
     global _MPU_TENSOR_MODEL_PARALLEL_RANK
     _MPU_TENSOR_MODEL_PARALLEL_RANK = None

@@ -2763,7 +2763,7 @@ def train(
             args.rampup_batch_size,
             args.global_batch_size,
             args.micro_batch_size,
-            mpu.get_data_parallel_world_size(),
+            mpu.get_effective_data_parallel_world_size(),
             args.decrease_batch_size_if_needed
         )
         print_rank_0(f"> GRPO training: num_microbatches set to {get_num_microbatches()}")
@@ -3052,7 +3052,9 @@ def train(
                 start_iteration = iteration + 1
             iteration += 1
             batch_size = (
-                mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
+                mpu.get_effective_data_parallel_world_size()
+                * args.micro_batch_size
+                * get_num_microbatches()
             )
             args.consumed_train_samples += batch_size
             args.skipped_train_samples += batch_size
@@ -3166,12 +3168,16 @@ def train(
             iteration_sequences = rl_utils.get_iteration_sequence_count(args)
             # Track bins separately for packed mode
             bin_count = (
-                mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
+                mpu.get_effective_data_parallel_world_size()
+                * args.micro_batch_size
+                * get_num_microbatches()
             )
             args.consumed_train_bins += bin_count
         else:
             batch_size = (
-                mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
+                mpu.get_effective_data_parallel_world_size()
+                * args.micro_batch_size
+                * get_num_microbatches()
             )
             iteration_sequences = batch_size
 
