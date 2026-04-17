@@ -492,8 +492,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # use_nvfuser = TORCH_MAJOR > 1 or (TORCH_MAJOR == 1 and TORCH_MINOR >= 10)
         # self.bias_dropout_add_exec_handler = nullcontext if use_nvfuser else torch.enable_grad
         self.bias_dropout_add_exec_handler = torch.enable_grad
-        if getattr(self.config, 'profile', False) or getattr(self.config, 'nvtx_ranges', False):
-            self._register_backward_profile_hooks()
+        self._register_backward_profile_hooks()
 
     def _register_backward_profile_hooks(self):
         """Register high-level backward profiling hooks on the layer and its major submodules."""
